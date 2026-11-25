@@ -1,4 +1,4 @@
-"""Cached-anchor construction with a bounded E1 x E1 arithmetic frontier."""
+"""Cached-anchor construction with a guaranteed Horner fallback from 1."""
 import csv
 import json
 import math
@@ -190,6 +190,46 @@ def replay(p, program):
     return not remaining
 
 
+def horner_plan(regs, goal, radix, dest, excluded=()):
+    digits = []
+    q = goal
+    best = None
+    lookup = {v: i for i, v in enumerate(regs)
+              if v is not None and i not in excluded}
+    while q:
+        if q in lookup:
+            src = lookup[q]
+            plan = []
+            for digit in reversed(digits):
+                plan.append(['*', src, radix - 1, dest])
+                src = dest
+                if digit:
+                    plan.append(['+', dest, digit - 1, dest])
+            if not plan and src != dest:
+                plan = [['*', src, 0, dest]]
+            if best is None or len(plan) < len(best):
+                best = plan
+        q, digit = divmod(q, radix)
+        digits.append(digit)
+    if best is None:
+        # No cached radix prefix: build the positive integer from a protected 1.
+        # Each binary prefix is <= goal, so intermediates respect value_limit.
+        one = next((i for i, v in enumerate(regs)
+                    if v == 1 and i != dest and i not in excluded), None)
+        if one is None:
+            return None
+        best = []
+        src = one
+        for bit in bin(goal)[3:]:
+            best.append(['+', src, src, dest])
+            src = dest
+            if bit == '1':
+                best.append(['+', dest, one, dest])
+        if not best and src != dest:
+            best.append(['*', one, one, dest])
+    return best
+
+
 def construct(p, radix, order, deep_deadline=0):
     limit = p['limit']
     radix = min(radix, limit)
@@ -217,27 +257,7 @@ def construct(p, radix, order, deep_deadline=0):
             emit('+', digit - 2, 0, digit - 1)
 
     def horner(goal, dest, excluded=()):
-        digits = []
-        q = goal
-        best = None
-        lookup = {v: i for i, v in enumerate(regs)
-                  if v is not None and i not in excluded}
-        while q:
-            if q in lookup:
-                src = lookup[q]
-                plan = []
-                for digit in reversed(digits):
-                    plan.append(['*', src, radix - 1, dest])
-                    src = dest
-                    if digit:
-                        plan.append(['+', dest, digit - 1, dest])
-                if not plan and src != dest:
-                    plan = [['*', src, 0, dest]]
-                if best is None or len(plan) < len(best):
-                    best = plan
-            q, digit = divmod(q, radix)
-            digits.append(digit)
-        return best
+        return horner_plan(regs, goal, radix, dest, excluded)
 
     cursor = 0
     for target in order:
@@ -380,6 +400,32 @@ def optimize(p, old, deadline, rng):
 def main():
     o = kt.optimization()
     if o['smoke']:
+        # 63 has radix-eight prefixes 63 and 7; neither is available here.
+        # Register 46 contains a stale prefix and must be excluded as a source.
+        fallback_checks = 0
+        for goal in (1, 2, 7, 63, 255, 10**18 - 1, 10**18):
+            for stale in (None, 7):
+                regs = [None] * 48
+                regs[0], regs[7], regs[46] = 1, 8, stale
+                plan = horner_plan(regs, goal, 8, 47, excluded=(46,))
+                assert plan is not None
+                state = regs[:]
+                for op, i, j, d in plan:
+                    assert i != 46 and j != 46
+                    assert state[i] is not None and state[j] is not None
+                    value = calc(op, state[i], state[j], max(goal, 8))
+                    assert value is not None, (goal, plan)
+                    state[d] = value
+                assert state[47] == goal and state[0] == 1
+                fallback_checks += 1
+        # Replay a whole constructor at exact limits and under register pressure.
+        for initial, targets, limit in (([3], [1, 2, 5, 8], 9),
+                                         (list(range(2, 50)), [1, 63, 127, 255], 255),
+                                         ([1], [1], 1)):
+            puzzle = dict(start=initial, targets=targets, limit=limit)
+            plan = construct(puzzle, 8, targets)
+            assert plan is not None and replay(puzzle, plan)
+        print('Horner fallback checks passed:', fallback_checks, flush=True)
         # A five-operation E3/E1 expression and a four-operation shared DAG.
         initial = [101, 173, 257, 389, 521, 769]
         for goal, upper in (((101 + 173) * (257 + 389) + 521 * 769, 5),
