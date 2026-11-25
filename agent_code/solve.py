@@ -52,21 +52,68 @@ def dce(puz, prog):
     return [p for p, k in zip(prog, keep) if k]
 
 
+def build(puz, p, bit):
+    regs = list(puz["start"]) + [None] * (48 - len(puz["start"]))
+    m = 0
+    for v in puz["start"]:
+        m |= bit.get(v, 0)
+    snap, cov = [], []
+    for op, i, j, d in p:
+        snap.append(tuple(regs)); cov.append(m)
+        a, b = regs[i], regs[j]
+        v = a + b if op == "+" else a * b if op == "*" else (a - b if op == "-" else a // b)
+        regs[d] = v
+        m |= bit.get(v, 0)
+    return snap, cov, m
+
+
+def tail_ok(p, start, regs, m, L, bit, full):
+    """Replay p[start:] from state (regs, m). Incremental: prefix is cached."""
+    regs = list(regs)
+    for k in range(start, len(p)):
+        op, i, j, d = p[k]
+        a, b = regs[i], regs[j]
+        if a is None or b is None: return False
+        if op == "+": v = a + b
+        elif op == "*": v = a * b
+        elif op == "-":
+            if a <= b: return False
+            v = a - b
+        else:
+            if a % b: return False
+            v = a // b
+        if v > L: return False
+        regs[d] = v
+        m |= bit.get(v, 0)
+    return m == full
+
+
 def improve(puz, prog, tlimit):
     p = dce(puz, prog)
     if not replay(puz, p): return prog
+    L = puz["limit"]
+    bit = {}
+    for t in set(puz["targets"]) - set(puz["start"]):
+        bit[t] = 1 << len(bit)
+    full = (1 << len(bit)) - 1
     t0 = time.time()
     changed = True
     while changed and time.time() - t0 < tlimit:
         changed = False
+        snap, cov, _ = build(puz, p, bit)
         n = len(p) - 1
         while n >= 0 and time.time() - t0 < tlimit:
             q = p[:n] + p[n + 1:]
-            if replay(puz, q):
+            if tail_ok(q, n, snap[n], cov[n], L, bit, full):
                 p2 = dce(puz, q)
                 p = p2 if replay(puz, p2) else q
                 changed = True
-                n = min(n, len(p)) - 1
+                if len(p) != len(q):
+                    snap, cov, _ = build(puz, p, bit)
+                    n = len(p) - 1
+                else:
+                    snap, cov, _ = build(puz, p, bit)
+                    n = min(n, len(p)) - 1
             else:
                 n -= 1
     return p
