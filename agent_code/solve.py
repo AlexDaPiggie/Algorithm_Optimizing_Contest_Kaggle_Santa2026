@@ -1,4 +1,4 @@
-"""Cached-anchor construction with a guaranteed Horner fallback from 1."""
+"""Cached-anchor search with cost-only Horner evaluation and lazy emission."""
 import csv
 import json
 import math
@@ -230,7 +230,201 @@ def horner_plan(regs, goal, radix, dest, excluded=()):
     return best
 
 
-def construct(p, radix, order, deep_deadline=0):
+class HornerFrontier:
+    """Score immutable register snapshots without allocating instruction lists.
+
+    A choice is (instruction_count, goal, source_register, suffix_depth).
+    Depth -1 denotes the protected-one binary fallback. Per-target caches are
+    discarded before any register write, so no cached source can become stale.
+    """
+
+    def __init__(self, regs, radix, dest):
+        self.radix = radix
+        self.dest = dest
+        self.lookup = {v: i for i, v in enumerate(regs) if v is not None}
+        self.scratch_lookup = {v: i for i, v in enumerate(regs)
+                               if v is not None and i != dest}
+        self.cache = ({}, {})
+        self.ones = (
+            next((i for i, v in enumerate(regs) if v == 1 and i != dest), None),
+            next((i for i, v in enumerate(regs)
+                  if v == 1 and i not in (47, dest)), None),
+        )
+
+    def choose(self, goal, scratch=False):
+        cache = self.cache[scratch]
+        found = cache.get(goal)
+        if found is not None:
+            return found
+        lookup = self.scratch_lookup if scratch else self.lookup
+        dest = 47 if scratch else self.dest
+        radix = self.radix
+        q = goal
+        depth = nonzero = 0
+        best = None
+        while q:
+            src = lookup.get(q)
+            if src is not None:
+                cost = depth + nonzero if depth else int(src != dest)
+                if best is None or cost < best[0]:
+                    best = (cost, goal, src, depth)
+            q, digit = divmod(q, radix)
+            depth += 1
+            nonzero += digit != 0
+        if best is None:
+            one = self.ones[scratch]
+            if one is None:
+                raise ValueError('missing protected one')
+            cost = goal.bit_length() + goal.bit_count() - 2
+            if goal == 1:
+                cost = int(one != dest)
+            best = (cost, goal, one, -1)
+        cache[goal] = best
+        return best
+
+    def emit(self, choice, scratch=False):
+        _, goal, src, depth = choice
+        dest = 47 if scratch else self.dest
+        out = []
+        if depth == -1:
+            one = src
+            for bit in bin(goal)[3:]:
+                out.append(['+', src, src, dest])
+                src = dest
+                if bit == '1':
+                    out.append(['+', dest, one, dest])
+            if not out and src != dest:
+                out.append(['*', one, one, dest])
+        else:
+            digits = []
+            for _ in range(depth):
+                goal, digit = divmod(goal, self.radix)
+                digits.append(digit)
+            for digit in reversed(digits):
+                out.append(['*', src, self.radix - 1, dest])
+                src = dest
+                if digit:
+                    out.append(['+', dest, digit - 1, dest])
+            if not out and src != dest:
+                out.append(['*', src, 0, dest])
+        return out
+
+
+def target_plan(regs, target, radix, dest, limit):
+    frontier = HornerFrontier(regs, radix, dest)
+    lookup = frontier.lookup
+    direct = frontier.choose(target)
+    best_cost = direct[0]
+    winner = ('direct', direct)
+    for anchor, value in enumerate(regs):
+        if value is None or anchor == dest:
+            continue
+        if value < target:
+            choice = frontier.choose(target - value)
+            if choice[0] + 1 < best_cost:
+                best_cost = choice[0] + 1
+                winner = ('add', anchor, choice)
+        if anchor == 47 or value <= radix:
+            continue
+        quotient = target // value
+        for scale in (quotient, quotient + 1):
+            if not 2 <= scale <= 65536:
+                continue
+            product = value * scale
+            if product > limit:
+                continue
+            gap = abs(target - product)
+            scale_reg = lookup.get(scale)
+            if scale_reg is not None and scale_reg != dest:
+                scale_choice = None
+                cost = 1
+            else:
+                scale_choice = frontier.choose(scale)
+                cost = scale_choice[0] + 1
+            # Offsets can only add cost; avoid even scoring hopeless moves.
+            if cost + bool(gap) >= best_cost:
+                continue
+            offset = frontier.choose(gap, True) if gap else None
+            if gap:
+                cost += offset[0] + 1
+            if cost < best_cost:
+                best_cost = cost
+                winner = ('multiply', anchor, scale_reg, scale_choice,
+                          offset, product < target)
+    if best_cost > 1:
+        for a, i in lookup.items():
+            possibilities = (('+', target - a, False),
+                             ('-', a - target, False),
+                             ('-', a + target, True),
+                             ('*', target // a if target % a == 0 else 0, False),
+                             ('/', a // target if a % target == 0 else 0, False),
+                             ('/', a * target, True))
+            for op, b, reverse in possibilities:
+                if b in lookup:
+                    j = lookup[b]
+                    return [[op, j, i, dest] if reverse else [op, i, j, dest]]
+    if winner[0] == 'direct':
+        return frontier.emit(winner[1])
+    if winner[0] == 'add':
+        return frontier.emit(winner[2]) + [['+', winner[1], dest, dest]]
+    _, anchor, scale_reg, scale_choice, offset, positive = winner
+    if scale_choice is None:
+        plan = [['*', anchor, scale_reg, dest]]
+    else:
+        plan = frontier.emit(scale_choice) + [['*', anchor, dest, dest]]
+    if offset is not None:
+        plan += frontier.emit(offset, True)
+        plan.append(['+' if positive else '-', dest, 47, dest])
+    return plan
+
+
+def reference_target_plan(regs, target, radix, dest, limit):
+    """Original eager evaluator, used only for differential smoke checks."""
+    best = horner_plan(regs, target, radix, dest)
+    lookup = {v: i for i, v in enumerate(regs) if v is not None}
+    for anchor, value in enumerate(regs):
+        if value is None or anchor == dest:
+            continue
+        if value < target:
+            plan = horner_plan(regs, target - value, radix, dest)
+            plan += [['+', anchor, dest, dest]]
+            if len(plan) < len(best):
+                best = plan
+        if anchor == 47 or value <= radix:
+            continue
+        quotient = target // value
+        for scale in (quotient, quotient + 1):
+            if not 2 <= scale <= 65536:
+                continue
+            product = value * scale
+            if product > limit:
+                continue
+            gap = abs(target - product)
+            if scale in lookup and lookup[scale] != dest:
+                plan = [['*', anchor, lookup[scale], dest]]
+            else:
+                plan = horner_plan(regs, scale, radix, dest)
+                plan += [['*', anchor, dest, dest]]
+            if gap:
+                plan += horner_plan(regs, gap, radix, 47, excluded=(dest,))
+                plan += [['+' if product < target else '-', dest, 47, dest]]
+            if len(plan) < len(best):
+                best = plan
+    for a, i in lookup.items():
+        possibilities = (('+', target - a, False),
+                         ('-', a - target, False),
+                         ('-', a + target, True),
+                         ('*', target // a if target % a == 0 else 0, False),
+                         ('/', a // target if a % target == 0 else 0, False),
+                         ('/', a * target, True))
+        for op, b, reverse in possibilities:
+            if b in lookup and len(best) > 1:
+                j = lookup[b]
+                best = [[op, j, i, dest] if reverse else [op, i, j, dest]]
+    return best
+
+
+def construct(p, radix, order, deep_deadline=0, fast=True):
     limit = p['limit']
     radix = min(radix, limit)
     regs = list(p['start']) + [None] * (48 - len(p['start']))
@@ -256,58 +450,14 @@ def construct(p, radix, order, deep_deadline=0):
         else:
             emit('+', digit - 2, 0, digit - 1)
 
-    def horner(goal, dest, excluded=()):
-        return horner_plan(regs, goal, radix, dest, excluded)
-
     cursor = 0
     for target in order:
         if target not in remaining:
             continue
         dest = radix + cursor % (47 - radix)
         cursor += 1
-        scratch = 47
-        best = horner(target, dest)
-        lookup = {v: i for i, v in enumerate(regs) if v is not None}
-        for anchor, value in enumerate(regs):
-            if value is None or anchor == dest:
-                continue
-            if value < target:
-                plan = horner(target - value, dest)
-                plan = plan + [['+', anchor, dest, dest]]
-                if len(plan) < len(best):
-                    best = plan
-            if anchor == scratch or value <= radix:
-                continue
-            quotient, remainder = divmod(target, value)
-            for scale in (quotient, quotient + 1):
-                if not 2 <= scale <= 65536:
-                    continue
-                product = value * scale
-                if product > limit:
-                    continue
-                gap = abs(target - product)
-                if scale in lookup and lookup[scale] != dest:
-                    plan = [['*', anchor, lookup[scale], dest]]
-                else:
-                    plan = horner(scale, dest)
-                    plan += [['*', anchor, dest, dest]]
-                if gap:
-                    offset = horner(gap, scratch, excluded=(dest,))
-                    plan += offset
-                    plan += [['+' if product < target else '-', dest, scratch, dest]]
-                if len(plan) < len(best):
-                    best = plan
-        for a, i in lookup.items():
-            possibilities = [('+', target - a, False),
-                             ('-', a - target, False),
-                             ('-', a + target, True),
-                             ('*', target // a if target % a == 0 else 0, False),
-                             ('/', a // target if a % target == 0 else 0, False),
-                             ('/', a * target, True)]
-            for op, b, reverse in possibilities:
-                if b in lookup and len(best) > 1:
-                    j = lookup[b]
-                    best = [[op, j, i, dest] if reverse else [op, i, j, dest]]
+        evaluator = target_plan if fast else reference_target_plan
+        best = evaluator(regs, target, radix, dest, limit)
         if len(best) > 1 and time.monotonic() < deep_deadline:
             plan = deep_plan(regs, target, limit, len(best), dest,
                              range(radix), min(deep_deadline, time.monotonic() + 0.06))
@@ -400,6 +550,19 @@ def optimize(p, old, deadline, rng):
 def main():
     o = kt.optimization()
     if o['smoke']:
+        check_rng = random.Random(914103)
+        for case in range(64):
+            radix = check_rng.choice((2, 4, 8, 16, 32))
+            limit = check_rng.choice((255, 10**6, 10**18))
+            regs = list(range(1, radix + 1))
+            regs += [check_rng.randint(1, limit) if check_rng.random() < 0.85
+                     else None for _ in range(48 - radix)]
+            dest = check_rng.randrange(radix, 47)
+            target = check_rng.randint(1, limit)
+            expected = reference_target_plan(regs, target, radix, dest, limit)
+            actual = target_plan(regs, target, radix, dest, limit)
+            assert actual == expected, (case, expected, actual)
+        print('Lazy/eager target plans match: 64 register snapshots', flush=True)
         # 63 has radix-eight prefixes 63 and 7; neither is available here.
         # Register 46 contains a stale prefix and must be excluded as a source.
         fallback_checks = 0
@@ -448,6 +611,27 @@ def main():
     with Path(o['best'] or locate('sample_submission.csv')).open(newline='', encoding='utf-8') as f:
         current = {r['id']: json.loads(r['program']) for r in csv.DictReader(f)}
     ids = sorted(puzzles)[:6] if o['smoke'] else sorted(puzzles)
+    if o['smoke']:
+        eager_seconds = lazy_seconds = 0.0
+        comparisons = 0
+        for pid in ids[:3]:
+            puzzle = puzzles[pid]
+            order = sorted(set(puzzle['targets']) - set(puzzle['start']))
+            for radix in (8, 16):
+                started = time.perf_counter()
+                expected = construct(puzzle, radix, order, fast=False)
+                eager_seconds += time.perf_counter() - started
+                started = time.perf_counter()
+                actual = construct(puzzle, radix, order)
+                lazy_seconds += time.perf_counter() - started
+                assert actual == expected, (pid, radix)
+                assert actual is None or replay(puzzle, actual), (pid, radix)
+                comparisons += 1
+        print('Full-constructor differential checks:', comparisons,
+              'eager_seconds', round(eager_seconds, 4),
+              'lazy_seconds', round(lazy_seconds, 4),
+              'speedup', round(eager_seconds / max(lazy_seconds, 1e-9), 2),
+              flush=True)
     rng = random.Random(o['seed'])
     deadline = time.monotonic() + (4 if o['smoke'] else 3000)
     for index, pid in enumerate(ids):
