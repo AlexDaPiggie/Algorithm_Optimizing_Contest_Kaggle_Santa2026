@@ -1,6 +1,8 @@
-"""Construct targets using cached multiplicative anchors and short offsets."""
+"""Anneal target visitation order to improve reuse of cached arithmetic anchors."""
 import csv
 import json
+import math
+import random
 import time
 from pathlib import Path
 from kaggle_agent import toolkit as kt
@@ -18,7 +20,7 @@ def calc(op, a, b, limit):
 def replay(p, program):
     if not isinstance(program, list) or len(program) > 4096:
         return False
-    if len(json.dumps(program, separators=(',', ':')).encode('utf-8')) > 131072:
+    if len(json.dumps(program, separators=(',', ':')).encode()) > 131072:
         return False
     regs = list(p['start']) + [None] * (48 - len(p['start']))
     remaining = set(p['targets']) - set(p['start'])
@@ -40,7 +42,7 @@ def replay(p, program):
     return not remaining
 
 
-def construct(p, radix):
+def construct(p, radix, order):
     limit = p['limit']
     radix = min(radix, limit)
     regs = list(p['start']) + [None] * (48 - len(p['start']))
@@ -90,11 +92,9 @@ def construct(p, radix):
         return best
 
     cursor = 0
-    for target in sorted(p['targets']):
+    for target in order:
         if target not in remaining:
             continue
-        # The final register is a dedicated temporary; other registers cache
-        # previous targets. The digit table remains resident throughout.
         dest = radix + cursor % (47 - radix)
         cursor += 1
         scratch = 47
@@ -108,11 +108,6 @@ def construct(p, radix):
                 plan = plan + [['+', anchor, dest, dest]]
                 if len(plan) < len(best):
                     best = plan
-
-            # target = anchor * quotient +/- remainder. Construct the product
-            # first and keep it alive while making the much smaller remainder.
-            # Only a bounded quotient is needed for the shared/multiplicative
-            # relationships; the direct Horner plan handles everything else.
             if anchor == scratch or value <= radix:
                 continue
             quotient, remainder = divmod(target, value)
@@ -127,16 +122,13 @@ def construct(p, radix):
                     plan = [['*', anchor, lookup[scale], dest]]
                 else:
                     plan = horner(scale, dest)
-                    plan = plan + [['*', anchor, dest, dest]]
+                    plan += [['*', anchor, dest, dest]]
                 if gap:
-                    # dest now holds the product; its old value cannot be used
-                    # to construct the offset. Scratch is otherwise disposable.
                     offset = horner(gap, scratch, excluded=(dest,))
                     plan += offset
                     plan += [['+' if product < target else '-', dest, scratch, dest]]
                 if len(plan) < len(best):
                     best = plan
-
         for a, i in lookup.items():
             possibilities = [('+', target - a, False),
                              ('-', a - target, False),
@@ -155,6 +147,83 @@ def construct(p, radix):
     return out if not remaining else None
 
 
+def mutate(order, rng):
+    """Mix small swaps/relocations with large block moves."""
+    trial = order[:]
+    n = len(trial)
+    if n < 2:
+        return trial
+    a, b = sorted(rng.sample(range(n), 2))
+    move = rng.randrange(5)
+    if move == 0:
+        trial[a], trial[b] = trial[b], trial[a]
+    elif move == 1:
+        trial.insert(a, trial.pop(b))
+    elif move == 2:
+        trial[a:b+1] = reversed(trial[a:b+1])
+    elif move == 3:
+        block = trial[a:b+1]
+        rng.shuffle(block)
+        trial[a:b+1] = block
+    else:
+        block = trial[a:b+1]
+        del trial[a:b+1]
+        pos = rng.randrange(len(trial) + 1)
+        trial[pos:pos] = block
+    return trial
+
+
+def optimize(p, old, deadline, rng):
+    best = old
+    order = sorted(set(p['targets']) - set(p['start']))
+    # Seed the search with the existing constructor's best radix.
+    state = None
+    attempts = 0
+    for radix in (16, 8, 32, 4, 2):
+        if state is not None and time.monotonic() >= deadline:
+            break
+        candidate = construct(p, radix, order)
+        attempts += 1
+        if candidate is None or not replay(p, candidate):
+            continue
+        if len(candidate) < len(best):
+            best = candidate
+        if state is None or len(candidate) < state[0]:
+            state = (len(candidate), radix, order[:])
+    if state is None or len(order) < 2:
+        return best, attempts
+    cost, radix, order = state
+    elite = (cost, radix, order[:])
+    start = time.monotonic()
+    stale = 0
+    while time.monotonic() < deadline:
+        trial = mutate(order, rng)
+        trial_radix = radix
+        if rng.random() < 0.08:
+            trial_radix = rng.choice((8, 16, 32, 4))
+        candidate = construct(p, trial_radix, trial)
+        attempts += 1
+        if candidate is None or not replay(p, candidate):
+            continue
+        score = len(candidate)
+        progress = (time.monotonic() - start) / max(0.001, deadline - start)
+        temperature = max(0.2, min(8.0, elite[0] * 0.012) * (1 - progress))
+        if score <= cost or rng.random() < math.exp((cost - score) / temperature):
+            cost, radix, order = score, trial_radix, trial
+        if score < elite[0]:
+            elite = (score, trial_radix, trial[:])
+            stale = 0
+        else:
+            stale += 1
+        if score < len(best):
+            best = candidate
+        if stale >= 20:
+            cost, radix, saved = elite
+            order = saved[:]
+            stale = 0
+    return best, attempts
+
+
 def main():
     o = kt.optimization()
     data = Path(o['data_dir'])
@@ -169,22 +238,19 @@ def main():
                                 limit=int(r['value_limit'])) for r in csv.DictReader(f)}
     with Path(o['best'] or locate('sample_submission.csv')).open(newline='', encoding='utf-8') as f:
         current = {r['id']: json.loads(r['program']) for r in csv.DictReader(f)}
-    deadline = time.monotonic() + (4 if o['smoke'] else 3600)
     ids = sorted(puzzles)[:6] if o['smoke'] else sorted(puzzles)
-    for pid in ids:
+    rng = random.Random(o['seed'])
+    deadline = time.monotonic() + (4 if o['smoke'] else 3000)
+    for index, pid in enumerate(ids):
+        puzzle = puzzles[pid]
         old = current[pid]
-        best = old
-        attempts = []
-        for radix in (16, 8, 32, 4, 2):
-            if attempts and time.monotonic() > deadline:
-                break
-            candidate = construct(puzzles[pid], radix)
-            valid = candidate is not None and replay(puzzles[pid], candidate)
-            attempts.append((radix, len(candidate) if candidate is not None else None, valid))
-            if valid and len(candidate) < len(best):
-                best = candidate
-        current[pid] = best
-        print(pid, 'before', len(old), 'after', len(best), 'candidates', attempts, flush=True)
+        if not replay(puzzle, old):
+            raise ValueError('invalid baseline ' + pid)
+        allocation = max(0, deadline - time.monotonic()) / (len(ids) - index)
+        candidate, attempts = optimize(puzzle, old, time.monotonic() + allocation, rng)
+        if len(candidate) < len(old) and replay(puzzle, candidate):
+            current[pid] = candidate
+        print(pid, 'before', len(old), 'after', len(current[pid]), 'attempts', attempts, flush=True)
     out = Path(o['solution'])
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open('w', newline='', encoding='utf-8') as f:
