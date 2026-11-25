@@ -1,4 +1,4 @@
-"""Adaptive near-product construction, protected Horner fallback and rewrites.
+"""Annealed arithmetic recipe selection with small and large DAG moves.
 
 Build targets around products of cached one-operation dictionary entries,
 then synthesize the signed residual. Preserve every shorter valid incumbent.
@@ -838,8 +838,186 @@ def smoke_checks():
     print('Destructive aliases, exact division and liveness checks passed', flush=True)
 
 
+
+def anneal_recipes(p, old, deadline, rng):
+    """Search whole dependency closures, including neutral and uphill moves.
+
+    Recipes always read earlier donor nodes, making every mutation acyclic.
+    Cost counts the union of instructions needed for all targets; it therefore
+    rewards sharing rather than the isolated length of a target expression.
+    """
+    dag = ArithmeticDAG(p, old)
+    initial = set(dag.initial)
+    original = list(dag.recipes)
+    pool = [[recipe] if recipe is not None else [] for recipe in original]
+    index = {v: n for n, v in enumerate(dag.values)}
+    selected = dag.closure()
+    compact = dag.allocate(selected)
+    best = old
+    if compact is not None and len(compact) < len(best) and replay(p, compact):
+        best = compact
+    best_recipes = list(original)
+    # Restrict dictionary size on very long baselines; retain target roots,
+    # seeds and frequently used dependencies before sampling other values.
+    uses = [0] * len(original)
+    for n in selected:
+        for a in set(original[n][1:]):
+            uses[a] += 1
+    sources = list(range(len(original)))
+    if len(sources) > 700:
+        roots = set(dag.roots)
+        sources.sort(key=lambda n: (n not in initial, n not in roots,
+                                    n not in selected, -uses[n], n))
+        sources = sources[:700]
+    harvest_end = min(deadline, time.monotonic() +
+                      max(0, deadline - time.monotonic()) * .22)
+    values = dag.values
+
+    def offer(value, op, a, b):
+        n = index.get(value)
+        if n is None or n in initial or n <= max(a, b):
+            return
+        recipe = (op, a, b)
+        if recipe not in pool[n]:
+            pool[n].append(recipe)
+
+    # Every matching result is a donor node, so all harvested operations are
+    # positive and within value_limit without constructing speculative values.
+    for k, a in enumerate(sources):
+        if k % 8 == 0 and time.monotonic() >= harvest_end:
+            break
+        av = values[a]
+        for b in sources[k:]:
+            bv = values[b]
+            offer(av + bv, '+', a, b)
+            if av > bv:
+                offer(av - bv, '-', a, b)
+            elif bv > av:
+                offer(bv - av, '-', b, a)
+            if av <= p['limit'] // bv:
+                offer(av * bv, '*', a, b)
+            if av % bv == 0:
+                offer(av // bv, '/', a, b)
+            if bv % av == 0:
+                offer(bv // av, '/', b, a)
+
+    mutable = [n for n, recipes in enumerate(pool) if len(recipes) > 1]
+    if not mutable or time.monotonic() >= deadline:
+        return best, 0, 0, len(mutable)
+    roots = dag.roots
+    initial_mask = sum(1 << n for n in initial)
+
+    def closure(recipes):
+        seen = set()
+        pending = list(roots)
+        while pending:
+            n = pending.pop()
+            if n in seen or n in initial:
+                continue
+            seen.add(n)
+            _, a, b = recipes[n]
+            pending.append(a)
+            pending.append(b)
+        return seen
+
+    def masks(recipes):
+        # Integer bitsets make the backward rebuild's marginal-cost estimate
+        # cheap; exact union size is recomputed before accepting the move.
+        result = [0] * len(recipes)
+        for n, recipe in enumerate(recipes):
+            if recipe is not None:
+                _, a, b = recipe
+                result[n] = result[a] | result[b] | (1 << n)
+        return result
+
+    current = list(original)
+    live = selected
+    cost = len(live)
+    best_cost = cost
+    best_state = list(current)
+    trials = hits = 0
+    start = time.monotonic()
+    duration = max(.001, deadline - start)
+    while time.monotonic() < deadline:
+        trials += 1
+        trial = list(current)
+        if trials % 17 == 0:
+            # Large neighborhood: rebuild backward from all roots. Operands
+            # already required by other targets get a direct sharing credit.
+            ancestor = masks(current)
+            required = sum(1 << n for n in roots)
+            noise = rng.uniform(.15, 1.8)
+            for n in range(len(trial) - 1, -1, -1):
+                if not (required >> n) & 1 or n in initial:
+                    continue
+                options = pool[n]
+                if len(options) > 1:
+                    def rank(recipe):
+                        _, a, b = recipe
+                        new = ((1 << a) | (1 << b)) & ~required
+                        new &= ~initial_mask
+                        cone = (ancestor[a] | ancestor[b]) & ~required
+                        return new.bit_count() + .16 * cone.bit_count() + rng.random() * noise
+                    trial[n] = min(options, key=rank)
+                _, a, b = trial[n]
+                required |= (1 << a) | (1 << b)
+        else:
+            active = [n for n in mutable if n in live]
+            count = 1 if rng.random() < .78 else rng.randint(2, 7)
+            for _ in range(count):
+                choices = active if active and rng.random() < .85 else mutable
+                n = rng.choice(choices)
+                trial[n] = rng.choice(pool[n])
+        new_live = closure(trial)
+        new_cost = len(new_live)
+        delta = new_cost - cost
+        phase = ((time.monotonic() - start) / duration * 5) % 1
+        temperature = 1.7 * (1 - phase) ** 2 + .06
+        if delta <= 0 or rng.random() < math.exp(-delta / temperature):
+            current, live, cost = trial, new_live, new_cost
+            if cost < best_cost:
+                best_cost = cost
+                best_state = list(current)
+            if cost < len(best):
+                dag.recipes = current
+                candidate = dag.allocate(live)
+                if candidate is not None and replay(p, candidate):
+                    best = candidate
+                    best_recipes = list(current)
+                    hits += 1
+        if trials % 211 == 0:
+            # Reheat around the shortest closure, allowing neutral recipes to
+            # change while keeping the valid output independently protected.
+            current = list(best_state if rng.random() < .8 else best_recipes)
+            live = closure(current)
+            cost = len(live)
+    return best, hits, trials, len(mutable)
+
+
+def annealing_checks():
+    # 30 and 35 have separate two-step recipes. Sharing the initially unused
+    # donor 5 yields both in three steps, but changing only 30 is cost neutral.
+    p = dict(start=[1, 6, 7, 10], targets=[30, 35], limit=100)
+    old = [['-', 1, 0, 9], ['+', 3, 3, 4], ['+', 4, 3, 5],
+           ['*', 2, 2, 6], ['+', 2, 2, 7], ['-', 6, 7, 8]]
+    assert replay(p, old)
+    new, hits, trials, alternatives = anneal_recipes(
+        p, old, time.monotonic() + .12, random.Random(27))
+    assert replay(p, new) and len(new) == 3, (len(new), trials, alternatives)
+    # Exact division and destination aliasing are independently replayed.
+    p = dict(start=[9, 3], targets=[1, 2, 6, 18], limit=18)
+    old = [['/', 0, 1, 2], ['/', 1, 1, 3], ['-', 1, 3, 4],
+           ['*', 1, 4, 5], ['*', 0, 4, 0]]
+    assert replay(p, old)
+    new, _, _, _ = anneal_recipes(p, old, time.monotonic() + .03, random.Random(28))
+    assert replay(p, new) and len(new) <= len(old)
+    print('Recipe annealing: shared closures, exact division and aliases passed', flush=True)
+
+
 def main():
     o = kt.optimization()
+    if o['smoke']:
+        annealing_checks()
     if o['smoke']:
         # Exercise shared branches, subtraction, fully occupied registers and
         # destination/source aliasing independently of the supplied baseline.
@@ -886,18 +1064,20 @@ def main():
             if len(fallback) < len(current[pid]) and replay(p, fallback):
                 current[pid] = fallback
         try:
-            trial = construct_remainders(p, time.monotonic() + max(0, end - time.monotonic()) * .8)
+            trial = construct_remainders(p, time.monotonic() + max(0, end - time.monotonic()) * .22)
         except (ValueError, KeyError, RecursionError) as exc:
             print(pid, 'construction discarded:', str(exc), flush=True)
             trial = None
         if trial is not None and len(trial) < len(current[pid]) and replay(p, trial):
             current[pid] = trial
         construction_length = len(trial) if trial is not None else None
-        new, hits = optimize(p, current[pid], end)
+        new, hits, trials, alternatives = anneal_recipes(
+            p, current[pid], end, random.Random(o['seed'] + k))
         if len(new) < len(current[pid]) and replay(p, new):
             current[pid] = new
         print(pid, len(old), '->', len(current[pid]),
-              'adaptive construction', construction_length, 'rewrites', hits, flush=True)
+              'adaptive construction', construction_length, 'annealing hits', hits,
+              'trials', trials, 'mutable nodes', alternatives, flush=True)
 
     out = Path(o['solution'])
     out.parent.mkdir(parents=True, exist_ok=True)
