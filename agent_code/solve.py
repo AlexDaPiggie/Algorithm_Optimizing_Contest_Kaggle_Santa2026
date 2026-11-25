@@ -1,4 +1,4 @@
-"""Cached-anchor construction with target-indexed, register-retained E1 x E1 joins."""
+"""Cached-anchor construction with an unconditional binary Horner fallback."""
 import csv
 import json
 import math
@@ -255,6 +255,10 @@ class HornerFrontier:
         self.scratch_lookup = {v: i for i, v in enumerate(regs)
                                if v is not None and i != dest}
         self.cache = ({}, {})
+        self.dictionary_ready = (
+            regs[:radix // 2] == list(range(1, radix // 2 + 1))
+            and radix // 2 < len(regs) and regs[radix // 2] == radix
+        )
         self.ones = (
             next((i for i, v in enumerate(regs) if v == 1 and i != dest), None),
             next((i for i, v in enumerate(regs)
@@ -268,8 +272,31 @@ class HornerFrontier:
             return found
         lookup = self.scratch_lookup if scratch else self.lookup
         dest = 47 if scratch else self.dest
-        best = None
-        for radix, signed in ((self.radix, True), (self.radix // 2, False)):
+        if not 0 < goal <= self.limit:
+            raise ValueError('Horner goal outside value_limit')
+        one = self.ones[scratch]
+        if one is None:
+            raise ValueError('missing protected one')
+        # A monotone binary chain from a preserved 1 needs no stepping stone,
+        # radix register, or digit dictionary. Every intermediate is <= goal.
+        # Compare cached binary prefixes too: a useful live prefix need not be
+        # aligned with either of the larger radices used below.
+        depth = goal.bit_length() - 1
+        cost = depth + goal.bit_count() - 1 if depth else int(one != dest)
+        best = (cost, goal, one, depth, 2, False)
+        q = goal
+        depth = nonzero = 0
+        while q:
+            src = lookup.get(q)
+            if src is not None:
+                cost = depth + nonzero if depth else int(src != dest)
+                if cost < best[0]:
+                    best = (cost, goal, src, depth, 2, False)
+            q, digit = divmod(q, 2)
+            depth += 1
+            nonzero += digit
+        radices = ((self.radix, True), (self.radix // 2, False)) if self.dictionary_ready else ()
+        for radix, signed in radices:
             if radix < 2:
                 continue
             q = goal
@@ -278,7 +305,7 @@ class HornerFrontier:
                 src = lookup.get(q)
                 if src is not None:
                     cost = depth + nonzero if depth else int(src != dest)
-                    if best is None or cost < best[0]:
+                    if cost < best[0]:
                         best = (cost, goal, src, depth, radix, signed)
                 q, digit = divmod(q, radix)
                 if signed and digit > radix // 2:
@@ -288,14 +315,6 @@ class HornerFrontier:
                     break
                 depth += 1
                 nonzero += digit != 0
-        if best is None:
-            one = self.ones[scratch]
-            if one is None:
-                raise ValueError('missing protected one')
-            cost = goal.bit_length() + goal.bit_count() - 2
-            if goal == 1:
-                cost = int(one != dest)
-            best = (cost, goal, one, -1, 2, False)
         cache[goal] = best
         return best
 
@@ -303,15 +322,17 @@ class HornerFrontier:
         _, goal, src, depth, radix, signed = choice
         dest = 47 if scratch else self.dest
         out = []
-        if depth == -1:
-            one = src
-            for bit in bin(goal)[3:]:
+        if radix == 2:
+            one = self.ones[scratch]
+            # The low `depth` bits extend the selected prefix. Avoid [-0:],
+            # which would accidentally rebuild an already resident goal.
+            for bit in (bin(goal)[-depth:] if depth else ''):
                 out.append(['+', src, src, dest])
                 src = dest
                 if bit == '1':
                     out.append(['+', dest, one, dest])
             if not out and src != dest:
-                out.append(['*', one, one, dest])
+                out.append(['*', src, one, dest])
         else:
             digits = []
             for _ in range(depth):
@@ -542,6 +563,40 @@ def smoke_checks():
     """Exercise signed borrows, exact-limit overshoots, and scratch aliasing."""
     rng = random.Random(914103)
     checks = 0
+    fallback_checks = 0
+    # No radix dictionary and no cached prefix besides 1: the fallback must
+    # work with a relocated 1, a full register file, and an exact target limit.
+    for full in (False, True):
+        for one_reg in (0, 5):
+            for goal in (1, 2, 3, 63, 4095, 2**59, 10**18):
+                regs = [max(1, goal - 1)] * 48 if full else [None] * 48
+                regs[one_reg] = 1
+                for scratch in (False, True):
+                    frontier = HornerFrontier(regs, 64, 46, goal)
+                    choice = frontier.choose(goal, scratch)
+                    plan = frontier.emit(choice, scratch)
+                    assert len(plan) == choice[0], (choice, plan)
+                    state = regs[:]
+                    for op, i, j, d in plan:
+                        assert d == (47 if scratch else 46)
+                        if scratch:
+                            assert i != 46 and j != 46
+                        assert state[i] is not None and state[j] is not None
+                        value = calc(op, state[i], state[j], goal)
+                        assert value is not None, (goal, plan)
+                        state[d] = value
+                    assert state[47 if scratch else 46] == goal
+                    assert state[one_reg] == 1
+                    fallback_checks += 1
+    # A binary prefix that is not a radix-32 or radix-16 prefix should be
+    # extended in two operations instead of being rebuilt from the dictionary.
+    regs = list(range(1, 17)) + [32, 123456789] + [None] * 30
+    target = 2 * regs[17] + 1
+    frontier = HornerFrontier(regs, 32, 18, target)
+    choice = frontier.choose(target)
+    assert choice[0] == 2 and choice[2] == 17 and choice[4] == 2, choice
+    assert replay(dict(start=regs[:18], targets=[target], limit=target), frontier.emit(choice))
+    print('Binary fallback checks passed:', fallback_checks + 1, flush=True)
     # E3 = (a*b + c*d), followed by an E1 partner; the first target reuses
     # a*b. Both require the new level and all four intermediates can stay live.
     initial = [101, 233, 487, 997]
@@ -644,6 +699,13 @@ def main():
         puzzles = {r['id']: dict(start=json.loads(r['starting_values']),
                                 targets=json.loads(r['targets']),
                                 limit=int(r['value_limit'])) for r in csv.DictReader(f)}
+    if o['smoke'] and 'scored_0006' in puzzles:
+        puzzle = puzzles['scored_0006']
+        order = sorted(set(puzzle['targets']) - set(puzzle['start']))
+        for radix in (32, 64, 16, 8, 4):
+            plan = construct(puzzle, radix, order)
+            assert plan is not None and replay(puzzle, plan), ('scored_0006', radix)
+        print('scored_0006 construction checks passed: 5 radices', flush=True)
     with Path(o['best'] or locate('sample_submission.csv')).open(newline='', encoding='utf-8') as f:
         current = {r['id']: json.loads(r['program']) for r in csv.DictReader(f)}
     ids = sorted(puzzles)[:6] if o['smoke'] else sorted(puzzles)
