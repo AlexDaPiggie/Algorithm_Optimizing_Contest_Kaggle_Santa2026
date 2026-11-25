@@ -1,4 +1,4 @@
-"""Cached-anchor search with cost-only Horner evaluation and lazy emission."""
+"""Cached-anchor construction using balanced digits and bounded intermediates."""
 import csv
 import json
 import math
@@ -190,57 +190,19 @@ def replay(p, program):
     return not remaining
 
 
-def horner_plan(regs, goal, radix, dest, excluded=()):
-    digits = []
-    q = goal
-    best = None
-    lookup = {v: i for i, v in enumerate(regs)
-              if v is not None and i not in excluded}
-    while q:
-        if q in lookup:
-            src = lookup[q]
-            plan = []
-            for digit in reversed(digits):
-                plan.append(['*', src, radix - 1, dest])
-                src = dest
-                if digit:
-                    plan.append(['+', dest, digit - 1, dest])
-            if not plan and src != dest:
-                plan = [['*', src, 0, dest]]
-            if best is None or len(plan) < len(best):
-                best = plan
-        q, digit = divmod(q, radix)
-        digits.append(digit)
-    if best is None:
-        # No cached radix prefix: build the positive integer from a protected 1.
-        # Each binary prefix is <= goal, so intermediates respect value_limit.
-        one = next((i for i, v in enumerate(regs)
-                    if v == 1 and i != dest and i not in excluded), None)
-        if one is None:
-            return None
-        best = []
-        src = one
-        for bit in bin(goal)[3:]:
-            best.append(['+', src, src, dest])
-            src = dest
-            if bit == '1':
-                best.append(['+', dest, one, dest])
-        if not best and src != dest:
-            best.append(['*', one, one, dest])
-    return best
-
-
 class HornerFrontier:
-    """Score immutable register snapshots without allocating instruction lists.
+    """Compare signed radix B and unsigned radix B/2 using one small dictionary.
 
-    A choice is (instruction_count, goal, source_register, suffix_depth).
-    Depth -1 denotes the protected-one binary fallback. Per-target caches are
-    discarded before any register write, so no cached source can become stale.
+    The protected constants are 1..B/2 and B, requiring B/2+1 registers.
+    Signed digits lie in [-B/2+1, B/2]. Multiplication before a subtraction
+    may exceed the final target, so every such intermediate is checked here.
+    Choices are immutable; instructions are allocated only for the winner.
     """
 
-    def __init__(self, regs, radix, dest):
+    def __init__(self, regs, radix, dest, limit):
         self.radix = radix
         self.dest = dest
+        self.limit = limit
         self.lookup = {v: i for i, v in enumerate(regs) if v is not None}
         self.scratch_lookup = {v: i for i, v in enumerate(regs)
                                if v is not None and i != dest}
@@ -258,19 +220,26 @@ class HornerFrontier:
             return found
         lookup = self.scratch_lookup if scratch else self.lookup
         dest = 47 if scratch else self.dest
-        radix = self.radix
-        q = goal
-        depth = nonzero = 0
         best = None
-        while q:
-            src = lookup.get(q)
-            if src is not None:
-                cost = depth + nonzero if depth else int(src != dest)
-                if best is None or cost < best[0]:
-                    best = (cost, goal, src, depth)
-            q, digit = divmod(q, radix)
-            depth += 1
-            nonzero += digit != 0
+        for radix, signed in ((self.radix, True), (self.radix // 2, False)):
+            if radix < 2:
+                continue
+            q = goal
+            depth = nonzero = 0
+            while q:
+                src = lookup.get(q)
+                if src is not None:
+                    cost = depth + nonzero if depth else int(src != dest)
+                    if best is None or cost < best[0]:
+                        best = (cost, goal, src, depth, radix, signed)
+                q, digit = divmod(q, radix)
+                if signed and digit > radix // 2:
+                    digit -= radix
+                    q += 1
+                if q and q * radix > self.limit:
+                    break
+                depth += 1
+                nonzero += digit != 0
         if best is None:
             one = self.ones[scratch]
             if one is None:
@@ -278,12 +247,12 @@ class HornerFrontier:
             cost = goal.bit_length() + goal.bit_count() - 2
             if goal == 1:
                 cost = int(one != dest)
-            best = (cost, goal, one, -1)
+            best = (cost, goal, one, -1, 2, False)
         cache[goal] = best
         return best
 
     def emit(self, choice, scratch=False):
-        _, goal, src, depth = choice
+        _, goal, src, depth, radix, signed = choice
         dest = 47 if scratch else self.dest
         out = []
         if depth == -1:
@@ -298,20 +267,24 @@ class HornerFrontier:
         else:
             digits = []
             for _ in range(depth):
-                goal, digit = divmod(goal, self.radix)
+                goal, digit = divmod(goal, radix)
+                if signed and digit > radix // 2:
+                    digit -= radix
+                    goal += 1
                 digits.append(digit)
+            radix_reg = self.radix // 2 if radix == self.radix else radix - 1
             for digit in reversed(digits):
-                out.append(['*', src, self.radix - 1, dest])
+                out.append(['*', src, radix_reg, dest])
                 src = dest
                 if digit:
-                    out.append(['+', dest, digit - 1, dest])
+                    out.append(['+' if digit > 0 else '-', dest, abs(digit) - 1, dest])
             if not out and src != dest:
                 out.append(['*', src, 0, dest])
         return out
 
 
 def target_plan(regs, target, radix, dest, limit):
-    frontier = HornerFrontier(regs, radix, dest)
+    frontier = HornerFrontier(regs, radix, dest, limit)
     lookup = frontier.lookup
     direct = frontier.choose(target)
     best_cost = direct[0]
@@ -378,55 +351,11 @@ def target_plan(regs, target, radix, dest, limit):
     return plan
 
 
-def reference_target_plan(regs, target, radix, dest, limit):
-    """Original eager evaluator, used only for differential smoke checks."""
-    best = horner_plan(regs, target, radix, dest)
-    lookup = {v: i for i, v in enumerate(regs) if v is not None}
-    for anchor, value in enumerate(regs):
-        if value is None or anchor == dest:
-            continue
-        if value < target:
-            plan = horner_plan(regs, target - value, radix, dest)
-            plan += [['+', anchor, dest, dest]]
-            if len(plan) < len(best):
-                best = plan
-        if anchor == 47 or value <= radix:
-            continue
-        quotient = target // value
-        for scale in (quotient, quotient + 1):
-            if not 2 <= scale <= 65536:
-                continue
-            product = value * scale
-            if product > limit:
-                continue
-            gap = abs(target - product)
-            if scale in lookup and lookup[scale] != dest:
-                plan = [['*', anchor, lookup[scale], dest]]
-            else:
-                plan = horner_plan(regs, scale, radix, dest)
-                plan += [['*', anchor, dest, dest]]
-            if gap:
-                plan += horner_plan(regs, gap, radix, 47, excluded=(dest,))
-                plan += [['+' if product < target else '-', dest, 47, dest]]
-            if len(plan) < len(best):
-                best = plan
-    for a, i in lookup.items():
-        possibilities = (('+', target - a, False),
-                         ('-', a - target, False),
-                         ('-', a + target, True),
-                         ('*', target // a if target % a == 0 else 0, False),
-                         ('/', a // target if a % target == 0 else 0, False),
-                         ('/', a * target, True))
-        for op, b, reverse in possibilities:
-            if b in lookup and len(best) > 1:
-                j = lookup[b]
-                best = [[op, j, i, dest] if reverse else [op, i, j, dest]]
-    return best
-
-
-def construct(p, radix, order, deep_deadline=0, fast=True):
+def construct(p, radix, order, deep_deadline=0):
     limit = p['limit']
-    radix = min(radix, limit)
+    # Use an even radix whose balanced dictionary fits in the register file.
+    radix = min(radix, 2 ** (limit.bit_length() - 1))
+    protected_count = radix // 2 + 1
     regs = list(p['start']) + [None] * (48 - len(p['start']))
     remaining = set(p['targets']) - set(p['start'])
     out = []
@@ -444,23 +373,23 @@ def construct(p, radix, order, deep_deadline=0, fast=True):
     emit('/', 0, 0, 0)
     if radix == 1:
         return out
-    for digit in range(2, radix + 1):
+    for digit in range(2, radix // 2 + 1):
         if digit % 2 == 0:
             emit('+', digit // 2 - 1, digit // 2 - 1, digit - 1)
         else:
             emit('+', digit - 2, 0, digit - 1)
+    emit('+', radix // 2 - 1, radix // 2 - 1, radix // 2)
 
     cursor = 0
     for target in order:
         if target not in remaining:
             continue
-        dest = radix + cursor % (47 - radix)
+        dest = protected_count + cursor % (47 - protected_count)
         cursor += 1
-        evaluator = target_plan if fast else reference_target_plan
-        best = evaluator(regs, target, radix, dest, limit)
+        best = target_plan(regs, target, radix, dest, limit)
         if len(best) > 1 and time.monotonic() < deep_deadline:
             plan = deep_plan(regs, target, limit, len(best), dest,
-                             range(radix), min(deep_deadline, time.monotonic() + 0.06))
+                             range(protected_count), min(deep_deadline, time.monotonic() + 0.06))
             if plan is not None and len(plan) < len(best):
                 best = plan
         for op, i, j, d in best:
@@ -499,13 +428,13 @@ def mutate(order, rng):
 def optimize(p, old, deadline, rng):
     best = old
     order = sorted(set(p['targets']) - set(p['start']))
-    # Seed the search with the existing constructor's best radix.
+    # Compare balanced dictionaries cheaply before spending time on deep joins.
     state = None
     attempts = 0
-    for radix in (16, 8, 32, 4, 2):
+    for radix in (32, 64, 16, 8, 4):
         if state is not None and time.monotonic() >= deadline:
             break
-        candidate = construct(p, radix, order, deadline)
+        candidate = construct(p, radix, order)
         attempts += 1
         if candidate is None or not replay(p, candidate):
             continue
@@ -523,7 +452,7 @@ def optimize(p, old, deadline, rng):
         trial = mutate(order, rng)
         trial_radix = radix
         if rng.random() < 0.08:
-            trial_radix = rng.choice((8, 16, 32, 4))
+            trial_radix = rng.choice((16, 32, 64, 8))
         candidate = construct(p, trial_radix, trial, deadline)
         attempts += 1
         if candidate is None or not replay(p, candidate):
@@ -547,57 +476,60 @@ def optimize(p, old, deadline, rng):
     return best, attempts
 
 
+def smoke_checks():
+    """Exercise signed borrows, exact-limit overshoots, and scratch aliasing."""
+    rng = random.Random(914103)
+    checks = 0
+    for radix in (2, 4, 8, 16, 32, 64):
+        constants = list(range(1, radix // 2 + 1)) + [radix]
+        for limit in (radix, radix ** 2 - 1, 10**6, 10**18):
+            regs = constants + [None] * (48 - len(constants))
+            for i in range(len(constants), 48):
+                if rng.random() < 0.8:
+                    regs[i] = rng.randint(1, limit)
+            dest = len(constants)
+            frontier = HornerFrontier(regs, radix, dest, limit)
+            goals = {1, limit, max(1, limit - 1), radix - 1,
+                     min(limit, radix ** 2 - 1)}
+            goals.update(rng.randint(1, limit) for _ in range(8))
+            for goal in goals:
+                for scratch in (False, True):
+                    choice = frontier.choose(goal, scratch)
+                    plan = frontier.emit(choice, scratch)
+                    assert len(plan) == choice[0], (choice, plan)
+                    state = regs[:]
+                    for op, i, j, d in plan:
+                        if scratch:
+                            assert i != dest and j != dest
+                        assert state[i] is not None and state[j] is not None
+                        value = calc(op, state[i], state[j], limit)
+                        assert value is not None, (goal, limit, plan)
+                        state[d] = value
+                    assert state[47 if scratch else dest] == goal
+                    assert state[:len(constants)] == constants
+                    checks += 1
+    # Signed base 64 represents 4095 as (64*64)-1. At limit 4095 that
+    # multiplication is forbidden, requiring the unsigned or binary path.
+    regs = list(range(1, 33)) + [64] + [None] * 15
+    frontier = HornerFrontier(regs, 64, 33, 4096)
+    signed = frontier.choose(4095)
+    assert signed[0] == 2 and signed[-1] is True
+    assert frontier.emit(signed) == [['*', 32, 32, 33], ['-', 33, 0, 33]]
+    frontier = HornerFrontier(regs, 64, 33, 4095)
+    assert frontier.choose(4095)[0] > 2
+    for initial, targets, limit in (([3], [1, 2, 5, 8], 9),
+                                     (list(range(2, 50)), [1, 63, 127, 255], 255),
+                                     ([1], [1], 1)):
+        puzzle = dict(start=initial, targets=targets, limit=limit)
+        plan = construct(puzzle, 32, targets)
+        assert plan is not None and replay(puzzle, plan)
+    print('Balanced-radix checks passed:', checks, flush=True)
+
+
 def main():
     o = kt.optimization()
     if o['smoke']:
-        check_rng = random.Random(914103)
-        for case in range(64):
-            radix = check_rng.choice((2, 4, 8, 16, 32))
-            limit = check_rng.choice((255, 10**6, 10**18))
-            regs = list(range(1, radix + 1))
-            regs += [check_rng.randint(1, limit) if check_rng.random() < 0.85
-                     else None for _ in range(48 - radix)]
-            dest = check_rng.randrange(radix, 47)
-            target = check_rng.randint(1, limit)
-            expected = reference_target_plan(regs, target, radix, dest, limit)
-            actual = target_plan(regs, target, radix, dest, limit)
-            assert actual == expected, (case, expected, actual)
-        print('Lazy/eager target plans match: 64 register snapshots', flush=True)
-        # 63 has radix-eight prefixes 63 and 7; neither is available here.
-        # Register 46 contains a stale prefix and must be excluded as a source.
-        fallback_checks = 0
-        for goal in (1, 2, 7, 63, 255, 10**18 - 1, 10**18):
-            for stale in (None, 7):
-                regs = [None] * 48
-                regs[0], regs[7], regs[46] = 1, 8, stale
-                plan = horner_plan(regs, goal, 8, 47, excluded=(46,))
-                assert plan is not None
-                state = regs[:]
-                for op, i, j, d in plan:
-                    assert i != 46 and j != 46
-                    assert state[i] is not None and state[j] is not None
-                    value = calc(op, state[i], state[j], max(goal, 8))
-                    assert value is not None, (goal, plan)
-                    state[d] = value
-                assert state[47] == goal and state[0] == 1
-                fallback_checks += 1
-        # Replay a whole constructor at exact limits and under register pressure.
-        for initial, targets, limit in (([3], [1, 2, 5, 8], 9),
-                                         (list(range(2, 50)), [1, 63, 127, 255], 255),
-                                         ([1], [1], 1)):
-            puzzle = dict(start=initial, targets=targets, limit=limit)
-            plan = construct(puzzle, 8, targets)
-            assert plan is not None and replay(puzzle, plan)
-        print('Horner fallback checks passed:', fallback_checks, flush=True)
-        # A five-operation E3/E1 expression and a four-operation shared DAG.
-        initial = [101, 173, 257, 389, 521, 769]
-        for goal, upper in (((101 + 173) * (257 + 389) + 521 * 769, 5),
-                            ((101 + 173) ** 2 + 257 + 389, 4)):
-            plan = deep_plan(initial + [None] * 42, goal, 10**9,
-                             upper + 1, 46, range(6), time.monotonic() + 1)
-            assert plan is not None and len(plan) <= upper, (goal, plan)
-            assert replay(dict(start=initial, targets=[goal], limit=10**9), plan)
-        print('DAG smoke checks passed', flush=True)
+        smoke_checks()
     data = Path(o['data_dir'])
 
     def locate(name):
@@ -611,27 +543,7 @@ def main():
     with Path(o['best'] or locate('sample_submission.csv')).open(newline='', encoding='utf-8') as f:
         current = {r['id']: json.loads(r['program']) for r in csv.DictReader(f)}
     ids = sorted(puzzles)[:6] if o['smoke'] else sorted(puzzles)
-    if o['smoke']:
-        eager_seconds = lazy_seconds = 0.0
-        comparisons = 0
-        for pid in ids[:3]:
-            puzzle = puzzles[pid]
-            order = sorted(set(puzzle['targets']) - set(puzzle['start']))
-            for radix in (8, 16):
-                started = time.perf_counter()
-                expected = construct(puzzle, radix, order, fast=False)
-                eager_seconds += time.perf_counter() - started
-                started = time.perf_counter()
-                actual = construct(puzzle, radix, order)
-                lazy_seconds += time.perf_counter() - started
-                assert actual == expected, (pid, radix)
-                assert actual is None or replay(puzzle, actual), (pid, radix)
-                comparisons += 1
-        print('Full-constructor differential checks:', comparisons,
-              'eager_seconds', round(eager_seconds, 4),
-              'lazy_seconds', round(lazy_seconds, 4),
-              'speedup', round(eager_seconds / max(lazy_seconds, 1e-9), 2),
-              flush=True)
+    before_total = sum(len(current[pid]) for pid in ids)
     rng = random.Random(o['seed'])
     deadline = time.monotonic() + (4 if o['smoke'] else 3000)
     for index, pid in enumerate(ids):
@@ -654,6 +566,8 @@ def main():
                 raise ValueError('invalid output ' + pid)
             writer.writerow([pid, json.dumps(current[pid], separators=(',', ':'))])
     print('deep search', DEEP_STATS, flush=True)
+    print('Validated output:', len(puzzles), 'puzzles; selected total',
+          before_total, '->', sum(len(current[pid]) for pid in ids), flush=True)
 
 
 if __name__ == '__main__':
