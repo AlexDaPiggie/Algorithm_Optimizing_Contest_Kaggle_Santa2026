@@ -1,4 +1,4 @@
-"""Target-indexed E1 x E1 DAG rewrites with retained register intermediates.
+"""Protected-one Horner fallback, followed by incumbent DAG rewrites.
 
 An incumbent remains the fallback. Replace an exclusive dependency cone only
 when its exact union of required instructions becomes smaller.
@@ -53,6 +53,109 @@ def replay(p, program):
         regs[d] = v
         remaining.discard(v)
     return not remaining
+
+
+def horner_fallback(p, radix=2):
+    """Construct every missing target even when no useful anchor exists.
+
+    Registers 0..radix-1 hold the protected constants 1..radix. Register
+    47 is scratch; the remaining registers cache completed targets. The
+    leading digit is always available, including 1 for binary Horner.
+    Each subsequent positive prefix is at most the target, so neither
+    doubling/multiplication nor adding a digit can exceed value_limit.
+    """
+    limit = p['limit']
+    radix = min(radix, limit)
+    if not 1 <= radix <= 32:
+        raise ValueError('Horner radix must be in 1..32')
+    regs = list(p['start']) + [None] * (48 - len(p['start']))
+    covered = set(p['start'])
+    program = []
+
+    def emit(op, i, j, d):
+        value = calc(op, regs[i], regs[j], limit)
+        if value is None:
+            raise ValueError('invalid Horner intermediate')
+        program.append([op, i, j, d])
+        regs[d] = value
+        covered.add(value)
+
+    if set(p['targets']) <= covered:
+        return program
+    if regs[0] != 1:
+        emit('/', 0, 0, 0)
+    if radix == 1:
+        return program
+    for value in range(2, radix + 1):
+        if regs[value - 1] != value:
+            emit('+', value - 2, 0, value - 1)
+
+    cursor = 0
+    for target in p['targets']:
+        if target in covered:
+            continue
+        digits = []
+        value = target
+        while value:
+            value, digit = divmod(value, radix)
+            digits.append(digit)
+        digits.reverse()
+        cache = {v: r for r, v in enumerate(regs[:47]) if v is not None}
+        # A missing stepping stone must not abort construction: the leading
+        # digit is protected, and for radix 2 this unconditionally starts at 1.
+        source = digits[0] - 1
+        begin = 1
+        prefix = 0
+        for pos, digit in enumerate(digits):
+            prefix = prefix * radix + digit
+            if prefix in cache:
+                source, begin = cache[prefix], pos + 1
+        steps = []
+        for digit in digits[begin:]:
+            if radix == 2:
+                steps.append(['+', source, source, 47])
+            else:
+                steps.append(['*', source, radix - 1, 47])
+            source = 47
+            if digit:
+                steps.append(['+', source, digit - 1, 47])
+        if not steps:
+            continue
+        # Preserve the final result without adding a copy instruction. Both
+        # sources are read before the destination is overwritten.
+        slots = list(range(radix, 47))
+        empty = next((r for r in slots if regs[r] is None), None)
+        dest = empty if empty is not None else slots[cursor % len(slots)]
+        cursor += 1
+        steps[-1][3] = dest
+        for op, i, j, d in steps:
+            emit(op, i, j, d)
+    return program
+
+
+def fallback_checks(puzzles):
+    """Exercise absent anchors, tight limits, aliases and full registers."""
+    cases = [
+        dict(start=[97], targets=[1, 2, 3, 6, 127, 255, 256, 999], limit=999),
+        dict(start=[1], targets=[1], limit=1),
+        dict(start=[2], targets=[1, 2], limit=2),
+        dict(start=[3], targets=[1, 2, 5, 8], limit=9),
+        dict(start=list(range(101, 149)),
+             targets=[1, 2, 3, 149, 65537, 10**18], limit=10**18),
+        dict(start=[10**18], targets=[1, 2**59, 10**18 - 1], limit=10**18),
+    ]
+    if 'scored_0006' in puzzles:
+        cases.append(puzzles['scored_0006'])
+    # More completed targets than cache registers forces safe overwrites.
+    cases.append(dict(start=[997], targets=list(range(1001, 1101)), limit=1100))
+    count = 0
+    for p in cases:
+        for radix in (2, 4, 8, 16, 32):
+            program = horner_fallback(p, radix)
+            if not replay(p, program):
+                raise ValueError('Horner fallback regression: radix ' + str(radix))
+            count += 1
+    print('Validated', count, 'Horner fallback regressions including absent anchors', flush=True)
 
 
 def inverses(t, b, limit):
@@ -451,6 +554,8 @@ def main():
         puzzles = {r['id']: dict(start=json.loads(r['starting_values']),
                                   targets=json.loads(r['targets']),
                                   limit=int(r['value_limit'])) for r in csv.DictReader(f)}
+    if o['smoke']:
+        fallback_checks(puzzles)
     with Path(o['best'] or locate('sample_submission.csv')).open(newline='', encoding='utf-8') as f:
         current = {r['id']: json.loads(r['program']) for r in csv.DictReader(f)}
     if set(current) != set(puzzles):
@@ -458,13 +563,22 @@ def main():
     for pid, p in puzzles.items():
         if not replay(p, current[pid]):
             raise ValueError('invalid baseline: ' + pid)
+    if o['smoke']:
+        for pid, p in puzzles.items():
+            if not replay(p, horner_fallback(p, 16)):
+                raise ValueError('invalid full-set Horner fallback: ' + pid)
+        print('Fresh Horner construction validated for', len(puzzles), 'puzzles', flush=True)
     ids = sorted(puzzles)[:6] if o['smoke'] else sorted(puzzles)
     before = sum(len(current[pid]) for pid in ids)
     deadline = time.monotonic() + (4.0 if o['smoke'] else 3000.0)
     for k, pid in enumerate(ids):
         old = current[pid]
+        for radix in (2, 4, 8, 16, 32):
+            fallback = horner_fallback(puzzles[pid], radix)
+            if len(fallback) < len(current[pid]) and replay(puzzles[pid], fallback):
+                current[pid] = fallback
         share = max(0, deadline - time.monotonic()) / (len(ids) - k)
-        new, hits = optimize(puzzles[pid], old, time.monotonic() + share)
+        new, hits = optimize(puzzles[pid], current[pid], time.monotonic() + share)
         if len(new) < len(old) and replay(puzzles[pid], new):
             current[pid] = new
         print(pid, len(old), '->', len(current[pid]), 'MITM cones', hits, flush=True)
