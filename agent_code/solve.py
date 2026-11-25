@@ -1,4 +1,4 @@
-"""Gap construction with a guaranteed positive Horner fallback."""
+"""Construct targets using cached multiplicative anchors and short offsets."""
 import csv
 import json
 import time
@@ -41,12 +41,6 @@ def replay(p, program):
 
 
 def construct(p, radix):
-    """Keep radix digits resident and construct gaps or targets in one register.
-
-    Every Horner intermediate is a positive prefix of its goal, hence within
-    value_limit. Starting at the leading digit (ultimately made from 1) makes
-    the plan defined even when no existing value is a useful stepping stone.
-    """
     limit = p['limit']
     radix = min(radix, limit)
     regs = list(p['start']) + [None] * (48 - len(p['start']))
@@ -63,8 +57,6 @@ def construct(p, radix):
 
     if not remaining:
         return out
-    # Digit n occupies register n-1. Overwriting a starting value is legal;
-    # initial target coverage was recorded before these writes.
     emit('/', 0, 0, 0)
     if radix == 1:
         return out
@@ -74,13 +66,12 @@ def construct(p, radix):
         else:
             emit('+', digit - 2, 0, digit - 1)
 
-    def horner(goal, dest):
-        # Any resident exact radix prefix is a possible stepping stone. The
-        # leading digit is always resident, providing an unconditional fallback.
+    def horner(goal, dest, excluded=()):
         digits = []
         q = goal
         best = None
-        lookup = {v: i for i, v in enumerate(regs) if v is not None}
+        lookup = {v: i for i, v in enumerate(regs)
+                  if v is not None and i not in excluded}
         while q:
             if q in lookup:
                 src = lookup[q]
@@ -96,28 +87,56 @@ def construct(p, radix):
                     best = plan
             q, digit = divmod(q, radix)
             digits.append(digit)
-        if best is None:
-            raise ValueError('missing leading digit')
         return best
 
     cursor = 0
     for target in sorted(p['targets']):
         if target not in remaining:
             continue
-        dest = radix + cursor % (48 - radix)
+        # The final register is a dedicated temporary; other registers cache
+        # previous targets. The digit table remains resident throughout.
+        dest = radix + cursor % (47 - radix)
         cursor += 1
+        scratch = 47
         best = horner(target, dest)
-        # Gaps may be cheaper than independent construction. An anchor must
-        # survive the Horner writes, so exclude the destination register.
-        for anchor, value in enumerate(regs):
-            if value is None or anchor == dest or value >= target:
-                continue
-            gap = horner(target - value, dest)
-            plan = gap + [['+', anchor, dest, dest]]
-            if len(plan) < len(best):
-                best = plan
-        # Preserve exact one-instruction opportunities, including division.
         lookup = {v: i for i, v in enumerate(regs) if v is not None}
+        for anchor, value in enumerate(regs):
+            if value is None or anchor == dest:
+                continue
+            if value < target:
+                plan = horner(target - value, dest)
+                plan = plan + [['+', anchor, dest, dest]]
+                if len(plan) < len(best):
+                    best = plan
+
+            # target = anchor * quotient +/- remainder. Construct the product
+            # first and keep it alive while making the much smaller remainder.
+            # Only a bounded quotient is needed for the shared/multiplicative
+            # relationships; the direct Horner plan handles everything else.
+            if anchor == scratch or value <= radix:
+                continue
+            quotient, remainder = divmod(target, value)
+            for scale in (quotient, quotient + 1):
+                if not 2 <= scale <= 65536:
+                    continue
+                product = value * scale
+                if product > limit:
+                    continue
+                gap = abs(target - product)
+                if scale in lookup and lookup[scale] != dest:
+                    plan = [['*', anchor, lookup[scale], dest]]
+                else:
+                    plan = horner(scale, dest)
+                    plan = plan + [['*', anchor, dest, dest]]
+                if gap:
+                    # dest now holds the product; its old value cannot be used
+                    # to construct the offset. Scratch is otherwise disposable.
+                    offset = horner(gap, scratch, excluded=(dest,))
+                    plan += offset
+                    plan += [['+' if product < target else '-', dest, scratch, dest]]
+                if len(plan) < len(best):
+                    best = plan
+
         for a, i in lookup.items():
             possibilities = [('+', target - a, False),
                              ('-', a - target, False),
