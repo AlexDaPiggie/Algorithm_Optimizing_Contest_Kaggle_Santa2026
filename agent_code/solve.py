@@ -1,4 +1,7 @@
-"""Protected-one Horner fallback, followed by incumbent DAG rewrites.
+"""Adaptive near-product construction, protected Horner fallback and rewrites.
+
+Build targets around products of cached one-operation dictionary entries,
+then synthesize the signed residual. Preserve every shorter valid incumbent.
 
 An incumbent remains the fallback. Replace an exclusive dependency cone only
 when its exact union of required instructions becomes smaller.
@@ -7,10 +10,12 @@ Inverse arithmetic joins two E1 entries, optionally under one more E1 operation,
 finding expressions of up to five operations without a quadratic E1 product.
 """
 import csv
+import bisect
 import heapq
 import json
 import random
 import time
+import math
 from pathlib import Path
 
 from kaggle_agent import toolkit as kt
@@ -484,6 +489,299 @@ def optimize(p, old, deadline):
     return best, hits
 
 
+class RemainderPlanner:
+    """Meet in the middle near the target, then construct its residual.
+
+    Instead of fixing one radix for every digit, choose a product of two
+    one-step dictionary values. An exact, inexpensive residual completes it.
+    All expressions refer to the current physical register snapshot.
+    """
+    def __init__(self, regs, limit, deadline):
+        self.frontier = Frontier(regs, limit)
+        self.e1 = self.frontier.e1
+        self.base = self.frontier.base
+        self.limit = limit
+        self.deadline = deadline
+        self.values = sorted(self.e1)
+        self.two_memo = {}
+        self.horner_memo = {}
+
+    def two(self, t):
+        if t in self.e1:
+            return self.e1[t]
+        if t in self.two_memo:
+            return self.two_memo[t]
+        if not 0 < t <= self.limit:
+            return None
+        for b, be in self.base.items():
+            for a, op, rev in inverses(t, b, self.limit):
+                ae = self.e1.get(a)
+                if ae is not None:
+                    expr = combine(op, ae, be, rev)
+                    self.two_memo[t] = expr
+                    return expr
+        self.two_memo[t] = None
+        return None
+
+    def horner(self, t):
+        if t in self.horner_memo:
+            return self.horner_memo[t]
+        result = self.two(t)
+        if result is not None:
+            self.horner_memo[t] = result
+            return result
+        best, cost = None, 10**6
+        # These radices are present in the bootstrap; missing ones are skipped.
+        for b in (16, 256, 65536, 4294967296):
+            if b not in self.base or b >= t:
+                continue
+            q, r = divmod(t, b)
+            qe = self.horner(q)
+            re = self.horner(r) if r else None
+            if qe is None or (r and re is None):
+                continue
+            prod = ('*', qe, self.base[b])
+            expr = ('+', prod, re) if r else prod
+            n = expression_cost(expr)
+            if n < cost:
+                best, cost = expr, n
+        # Constants 1..8 and 16 supply every radix-16 digit in at most one op.
+        self.horner_memo[t] = best
+        return best
+
+    def find(self, target):
+        best = self.horner(target)
+        cost = expression_cost(best) if best is not None else 10**6
+        if cost <= 2:
+            return best
+        direct = self.frontier.join(target, self.deadline)
+        if direct is not None and expression_cost(direct) < cost:
+            best, cost = direct, expression_cost(direct)
+        if cost <= 3 or time.monotonic() >= self.deadline:
+            return best
+
+        # Nearest neighbours of target/a are the most promising E1 partners.
+        # Retain a residual diversity set so a slightly larger but exactly
+        # constructible residual can beat the nearest numerical product.
+        proposals = {}
+        vals, e1 = self.values, self.e1
+
+        def offer(value, expr, prod_cost):
+            nonlocal best, cost
+            if not 0 < value <= self.limit:
+                return
+            residual = abs(target - value)
+            if not residual:
+                n = expression_cost(expr)
+                if n < cost:
+                    best, cost = expr, n
+                return
+            re = e1.get(residual)
+            if re is not None:
+                plan = ('+', expr, re) if value < target else ('-', expr, re)
+                n = expression_cost(plan)
+                if n < cost:
+                    best, cost = plan, n
+            if prod_cost + 1 >= cost:
+                return
+            key = (residual, value < target)
+            old = proposals.get(key)
+            if old is None or prod_cost < old[0]:
+                proposals[key] = (prod_cost, expr)
+
+        pos = bisect.bisect_left(vals, target)
+        for a in vals[max(0, pos - 12):pos + 12]:
+            ae = e1[a]
+            offer(a, ae, int(not isinstance(ae, int)))
+        center = bisect.bisect_left(vals, math.isqrt(target))
+        step = max(1, len(vals) // 192)
+        factors = list(dict.fromkeys(
+            vals[max(0, center - 160):center + 160] +
+            list(self.base) + vals[::step]))
+        enum_deadline = time.monotonic() + max(0, self.deadline - time.monotonic()) * .45
+        for k, a in enumerate(factors):
+            if k % 32 == 0 and time.monotonic() >= enum_deadline:
+                break
+            if a == 1:
+                continue
+            q = target // a
+            j = bisect.bisect_left(vals, q)
+            ae = e1[a]
+            for b in vals[max(0, j - 1):j + 2]:
+                if b == 1:
+                    continue
+                value = a * b
+                if value > self.limit:
+                    continue
+                be = e1[b]
+                expr = ('*', ae, be)
+                pcost = 1 + int(not isinstance(ae, int))
+                if be != ae:
+                    pcost += int(not isinstance(be, int))
+                offer(value, expr, pcost)
+
+        # Estimated residual complexity only ranks probes. Acceptance always
+        # uses the exact union of immutable expression nodes.
+        ranked = sorted(proposals.items(), key=lambda x: (
+            x[1][0] * 6 + x[0][0].bit_length(), x[0][0]))
+        for k, ((residual, below), (pcost, prod)) in enumerate(ranked[:192]):
+            if k % 8 == 0 and time.monotonic() >= self.deadline:
+                break
+            re = self.two(residual)
+            if re is None and k < 8:
+                re = self.horner(residual)
+            if re is None:
+                continue
+            expr = ('+' if below else '-', prod, re)
+            n = expression_cost(expr)
+            if n < cost:
+                best, cost = expr, n
+                if cost <= 3:
+                    break
+        for (residual, below), (pcost, prod) in ranked[:12]:
+            if pcost + 3 >= cost or time.monotonic() >= self.deadline:
+                continue
+            re = self.frontier.join(residual, self.deadline)
+            if re is not None:
+                expr = ('+' if below else '-', prod, re)
+                n = expression_cost(expr)
+                if n < cost:
+                    best, cost = expr, n
+        return best
+
+
+class ConstructCache:
+    """Physical cache; pin all expression leaves until its last instruction."""
+    def __init__(self, p):
+        self.p = p
+        self.regs = p['start'][:] + [None] * (48 - len(p['start']))
+        self.program = []
+        self.covered = set(p['start'])
+        self.protected = set(p['start'])
+        self.age = [0] * 48
+        self.clock = 0
+
+    def emit(self, expr):
+        nodes = []
+        seen = set()
+        leaves = set()
+
+        def visit(e):
+            if isinstance(e, int):
+                leaves.add(e)
+                return
+            if e in seen:
+                return
+            seen.add(e)
+            visit(e[1])
+            visit(e[2])
+            nodes.append(e)
+        visit(expr)
+        loc = {r: r for r in leaves}
+        uses = {e: 0 for e in leaves | seen}
+        for e in nodes:
+            for a in set(e[1:]):
+                uses[a] += 1
+        for e in nodes:
+            op, a, b = e
+            i, j = loc[a], loc[b]
+            value = calc(op, self.regs[i], self.regs[j], self.p['limit'])
+            if value is None:
+                raise ValueError('invalid adaptive remainder expression')
+            # Reuse a cached result only if the physical value is still live.
+            existing = next((r for r, v in enumerate(self.regs) if v == value), None)
+            if existing is not None:
+                d = existing
+            else:
+                locked = {loc[x] for x, n in uses.items() if n and x in loc}
+                # A last-use source can be overwritten by its result.
+                for x in set((a, b)):
+                    if uses[x] == 1:
+                        r = loc[x]
+                        if all(y == x or not n or y not in loc or loc[y] != r
+                               for y, n in uses.items()):
+                            locked.discard(r)
+                slots = [r for r in range(48) if r not in locked
+                         and self.regs[r] not in self.protected]
+                if not slots:
+                    raise ValueError('adaptive expression exceeds register budget')
+                d = min(slots, key=lambda r: (
+                    self.regs[r] is not None,
+                    # Keep the most recent arithmetic intermediates.
+                    self.age[r]))
+                self.program.append([op, i, j, d])
+                self.regs[d] = value
+                self.clock += 1
+                self.age[d] = self.clock
+                self.covered.add(value)
+            loc[e] = d
+            for x in set((a, b)):
+                uses[x] -= 1
+        return loc[expr] if not isinstance(expr, int) else expr
+
+    def bootstrap(self):
+        # Preserve original seeds, rather than overwriting all of them with
+        # consecutive small digits. They become free adaptive radices.
+        if len(self.protected) > 12:
+            return False
+        for target in range(1, min(8, self.p['limit']) + 1):
+            if target not in self.regs:
+                f = Frontier(self.regs, self.p['limit'])
+                expr = f.e1.get(target)
+                if expr is None:
+                    return False
+                self.emit(expr)
+            self.protected.add(target)
+        if self.p['limit'] >= 16 and 16 not in self.regs:
+            self.emit(('+', self.regs.index(8), self.regs.index(8)))
+            self.protected.add(16)
+        for v in (16, 256, 65536):
+            if v in self.regs and v * v <= self.p['limit']:
+                self.emit(('*', self.regs.index(v), self.regs.index(v)))
+                self.protected.add(v * v)
+        # Two native seed powers diversify product magnitudes without making
+        # every target pay for a long fixed-radix bootstrap.
+        root = math.isqrt(max(self.p['targets']))
+        for seed in sorted(set(self.p['start']))[-4:]:
+            v = seed
+            if v > 1 and v in self.regs and v * v <= self.p['limit']:
+                self.emit(('*', self.regs.index(v), self.regs.index(v)))
+                v *= v
+                # Place anchors near sqrt(target), the scale where a product
+                # of two dictionary entries spans the target range.
+                while v * 16 < root and v * 16 <= self.p['limit']:
+                    self.emit(('*', self.regs.index(v), self.regs.index(16)))
+                    v *= 16
+                self.protected.add(v)
+        return True
+
+
+def construct_remainders(p, deadline, reverse=False):
+    cache = ConstructCache(p)
+    if not cache.bootstrap():
+        return None
+    targets = sorted(p['targets'], reverse=reverse)
+    for k, target in enumerate(targets):
+        if target in cache.covered:
+            continue
+        if time.monotonic() >= deadline:
+            return None
+        share = (deadline - time.monotonic()) / max(1, len(targets) - k)
+        planner = RemainderPlanner(cache.regs, p['limit'], time.monotonic() + share)
+        expr = planner.find(target)
+        if expr is None:
+            return None
+        cache.emit(expr)
+    if replay(p, cache.program):
+        # Remove bootstrap values which the resulting program never used.
+        dag = ArithmeticDAG(p, cache.program)
+        compact = dag.allocate(dag.closure())
+        if compact is not None and len(compact) < len(cache.program) and replay(p, compact):
+            return compact
+        return cache.program
+    return None
+
+
 def smoke_checks():
     # Independent E1 branches below another E1 branch exercise genuine
     # four/five-operation plans and eliminate a longer incumbent cone.
@@ -543,7 +841,22 @@ def smoke_checks():
 def main():
     o = kt.optimization()
     if o['smoke']:
-        smoke_checks()
+        # Exercise shared branches, subtraction, fully occupied registers and
+        # destination/source aliasing independently of the supplied baseline.
+        p = dict(start=[11, 7], targets=[18, 324, 313], limit=324)
+        c = ConstructCache(p)
+        shared = ('+', 0, 1)
+        c.emit(('-', ('*', shared, shared), 0))
+        assert len(c.program) == 3 and replay(p, c.program)
+        p = dict(start=list(range(101, 149)), targets=[sum(range(101, 149))], limit=10000)
+        c = ConstructCache(p)
+        c.protected = set()
+        expr = 0
+        for r in range(1, 48):
+            expr = ('+', expr, r)
+        c.emit(expr)
+        assert replay(p, c.program)
+        print('Adaptive cache: shared nodes, signed residuals and 48-register aliases passed', flush=True)
     data = Path(o['data_dir'])
 
     def locate(name):
@@ -552,10 +865,8 @@ def main():
 
     with locate('puzzles.csv').open(newline='', encoding='utf-8') as f:
         puzzles = {r['id']: dict(start=json.loads(r['starting_values']),
-                                  targets=json.loads(r['targets']),
-                                  limit=int(r['value_limit'])) for r in csv.DictReader(f)}
-    if o['smoke']:
-        fallback_checks(puzzles)
+                                 targets=json.loads(r['targets']),
+                                 limit=int(r['value_limit'])) for r in csv.DictReader(f)}
     with Path(o['best'] or locate('sample_submission.csv')).open(newline='', encoding='utf-8') as f:
         current = {r['id']: json.loads(r['program']) for r in csv.DictReader(f)}
     if set(current) != set(puzzles):
@@ -563,25 +874,31 @@ def main():
     for pid, p in puzzles.items():
         if not replay(p, current[pid]):
             raise ValueError('invalid baseline: ' + pid)
-    if o['smoke']:
-        for pid, p in puzzles.items():
-            if not replay(p, horner_fallback(p, 16)):
-                raise ValueError('invalid full-set Horner fallback: ' + pid)
-        print('Fresh Horner construction validated for', len(puzzles), 'puzzles', flush=True)
+
     ids = sorted(puzzles)[:6] if o['smoke'] else sorted(puzzles)
     before = sum(len(current[pid]) for pid in ids)
-    deadline = time.monotonic() + (4.0 if o['smoke'] else 3000.0)
+    deadline = time.monotonic() + (5.0 if o['smoke'] else 3000.0)
     for k, pid in enumerate(ids):
-        old = current[pid]
+        p, old = puzzles[pid], current[pid]
+        end = time.monotonic() + max(0, deadline - time.monotonic()) / (len(ids) - k)
         for radix in (2, 4, 8, 16, 32):
-            fallback = horner_fallback(puzzles[pid], radix)
-            if len(fallback) < len(current[pid]) and replay(puzzles[pid], fallback):
+            fallback = horner_fallback(p, radix)
+            if len(fallback) < len(current[pid]) and replay(p, fallback):
                 current[pid] = fallback
-        share = max(0, deadline - time.monotonic()) / (len(ids) - k)
-        new, hits = optimize(puzzles[pid], current[pid], time.monotonic() + share)
-        if len(new) < len(old) and replay(puzzles[pid], new):
+        try:
+            trial = construct_remainders(p, time.monotonic() + max(0, end - time.monotonic()) * .8)
+        except (ValueError, KeyError, RecursionError) as exc:
+            print(pid, 'construction discarded:', str(exc), flush=True)
+            trial = None
+        if trial is not None and len(trial) < len(current[pid]) and replay(p, trial):
+            current[pid] = trial
+        construction_length = len(trial) if trial is not None else None
+        new, hits = optimize(p, current[pid], end)
+        if len(new) < len(current[pid]) and replay(p, new):
             current[pid] = new
-        print(pid, len(old), '->', len(current[pid]), 'MITM cones', hits, flush=True)
+        print(pid, len(old), '->', len(current[pid]),
+              'adaptive construction', construction_length, 'rewrites', hits, flush=True)
+
     out = Path(o['solution'])
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open('w', newline='', encoding='utf-8') as f:
@@ -597,3 +914,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
