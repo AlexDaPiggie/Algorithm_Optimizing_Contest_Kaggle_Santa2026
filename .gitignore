@@ -1,0 +1,19 @@
+# Code only: data, predictions and supervisor state stay out of git
+data/
+.kaggle-agent/
+*.zip
+*.parquet
+*.feather
+*.npy
+*.npz
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.ckpt
+submission*.csv
+oof*.csv
+catboost_info/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
