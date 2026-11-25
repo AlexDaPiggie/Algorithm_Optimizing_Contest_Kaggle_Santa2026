@@ -1,4 +1,4 @@
-"""Cached-anchor construction using balanced digits and bounded intermediates."""
+"""Annealed target ordering with bidirectional cached-anchor residual moves."""
 import csv
 import json
 import math
@@ -292,11 +292,13 @@ def target_plan(regs, target, radix, dest, limit):
     for anchor, value in enumerate(regs):
         if value is None or anchor == dest:
             continue
-        if value < target:
-            choice = frontier.choose(target - value)
+        if value != target:
+            # A larger live anchor can be just as close as a smaller one.
+            # Build the positive residual in dest before reading the anchor.
+            choice = frontier.choose(abs(target - value))
             if choice[0] + 1 < best_cost:
                 best_cost = choice[0] + 1
-                winner = ('add', anchor, choice)
+                winner = ('offset', anchor, choice, value < target)
         if anchor == 47 or value <= radix:
             continue
         quotient = target // value
@@ -338,8 +340,9 @@ def target_plan(regs, target, radix, dest, limit):
                     return [[op, j, i, dest] if reverse else [op, i, j, dest]]
     if winner[0] == 'direct':
         return frontier.emit(winner[1])
-    if winner[0] == 'add':
-        return frontier.emit(winner[2]) + [['+', winner[1], dest, dest]]
+    if winner[0] == 'offset':
+        return frontier.emit(winner[2]) + [
+            ['+' if winner[3] else '-', winner[1], dest, dest]]
     _, anchor, scale_reg, scale_choice, offset, positive = winner
     if scale_choice is None:
         plan = [['*', anchor, scale_reg, dest]]
@@ -444,6 +447,17 @@ def optimize(p, old, deadline, rng):
             state = (len(candidate), radix, order[:])
     if state is None or len(order) < 2:
         return best, attempts
+    # Descending traversal exposes larger targets as anchors immediately;
+    # retain it only when its actual constructed program is shorter.
+    if time.monotonic() < deadline:
+        reverse_order = order[::-1]
+        candidate = construct(p, state[1], reverse_order)
+        attempts += 1
+        if candidate is not None and replay(p, candidate):
+            if len(candidate) < len(best):
+                best = candidate
+            if len(candidate) < state[0]:
+                state = (len(candidate), state[1], reverse_order)
     cost, radix, order = state
     elite = (cost, radix, order[:])
     start = time.monotonic()
@@ -480,6 +494,19 @@ def smoke_checks():
     """Exercise signed borrows, exact-limit overshoots, and scratch aliasing."""
     rng = random.Random(914103)
     checks = 0
+    # Residual 37 needs two Horner operations with this dictionary. The final
+    # subtraction must read the preserved larger anchor, not overwritten dest.
+    for target in (10**12, 10**18 - 40):
+        for sign in (-1, 1):
+            initial = list(range(1, 17)) + [32, 99, target + sign * 37]
+            limit = max(initial[-1], target)
+            puzzle = dict(start=initial, targets=[target], limit=limit)
+            regs = initial + [None] * (48 - len(initial))
+            plan = target_plan(regs, target, 32, 17, limit)
+            assert len(plan) == 3, plan
+            assert plan[-1] == ['-' if sign > 0 else '+', 18, 17, 17], plan
+            assert replay(puzzle, plan), (puzzle, plan)
+    print('Bidirectional residual checks passed: 4', flush=True)
     for radix in (2, 4, 8, 16, 32, 64):
         constants = list(range(1, radix // 2 + 1)) + [radix]
         for limit in (radix, radix ** 2 - 1, 10**6, 10**18):
