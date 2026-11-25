@@ -1,4 +1,5 @@
-"""Cached-anchor construction with an unconditional binary Horner fallback."""
+"""Retain useful arithmetic prefixes with future-aware register allocation."""
+import bisect
 import csv
 import json
 import math
@@ -423,7 +424,104 @@ def target_plan(regs, target, radix, dest, limit):
     return plan
 
 
-def construct(p, radix, order, deep_deadline=0):
+class PrefixCache:
+    """Keep computed Horner prefixes instead of destroying them in one scratch.
+
+    A whole target recipe is first converted to immutable value generations.
+    Registers needed later in that recipe stay pinned. Other slots are evicted
+    by their estimated savings on the still-unbuilt targets, favoring exact
+    binary/balanced-radix prefixes and close arithmetic anchors.
+    """
+
+    def __init__(self, order, radix):
+        self.order = order
+        self.radix = radix
+        self.wishes = {}
+        for position, target in enumerate(order):
+            wanted = set()
+            for base, signed in ((2, False), (radix, True), (radix // 2, False)):
+                if base < 2:
+                    continue
+                q = target
+                while q:
+                    wanted.add(q)
+                    q, digit = divmod(q, base)
+                    if signed and digit > base // 2:
+                        q += 1
+            for value in wanted:
+                self.wishes.setdefault(value, []).append(position)
+
+    def apply(self, plan, regs, protected_count, position, emit, limit):
+        # Logical registers in the original recipe can be written many times.
+        # Assign each write a fresh node before selecting physical registers.
+        logical = list(range(48))
+        physical = {i: i for i, value in enumerate(regs) if value is not None}
+        last_use = {}
+        steps = []
+        values = regs[:]
+        for step, (op, i, j, d) in enumerate(plan):
+            left, right = logical[i], logical[j]
+            last_use[left] = last_use[right] = step
+            value = calc(op, values[left], values[right], limit)
+            if value is None:
+                raise ValueError('invalid logical recipe')
+            node = len(values)
+            values.append(value)
+            logical[d] = node
+            steps.append((op, left, right, node, value))
+
+        future = self.order[position + 1:]
+        scores = {None: -1.0}
+        rate = 2.0 / math.log2(max(2, self.radix))
+
+        def importance(value):
+            if value in scores:
+                return scores[value]
+            hits = self.wishes.get(value, ())
+            count = len(hits) - bisect.bisect_right(hits, position)
+            prefix = max(0.0, value.bit_length() * rate - 1.0)
+            score = prefix * (1 + 0.35 * (count - 1)) if count else 0.0
+            # Targets can remain valuable through a small residual or scale,
+            # even when they are not an exact digit prefix of another target.
+            if value > self.radix:
+                for target in future:
+                    gap = abs(target - value)
+                    if not gap:
+                        score = max(score, target.bit_length() * rate)
+                        continue
+                    saving = (target.bit_length() - gap.bit_length()) * rate - 1
+                    score = max(score, saving)
+                    q, rem = divmod(target, value)
+                    if q:
+                        small = min(rem, value - rem)
+                        saving = ((target.bit_length() - q.bit_length()
+                                   - small.bit_length()) * rate - 2)
+                        score = max(score, saving)
+            scores[value] = score
+            return score
+
+        for step, (op, left, right, node, value) in enumerate(steps):
+            i, j = physical[left], physical[right]
+            # A copied constant or repeated prefix is already available. Bind
+            # its new generation directly to that slot without an instruction.
+            resident = next((r for r, existing in enumerate(regs)
+                             if existing == value), None)
+            if resident is not None:
+                physical[node] = resident
+                continue
+            # A source at its last use can be overwritten by this instruction.
+            pinned = {physical[n] for n, use in last_use.items()
+                      if use > step and n in physical}
+            slots = [r for r in range(protected_count, 48) if r not in pinned]
+            if not slots:
+                raise ValueError('recipe exceeds available registers')
+            dest = min(slots, key=lambda r: (importance(regs[r]),
+                                             regs[r] is not None, r))
+            emit(op, i, j, dest)
+            physical[node] = dest
+
+
+def construct(p, radix, order, deep_deadline=0, retain_prefixes=True):
     limit = p['limit']
     # Use an even radix whose balanced dictionary fits in the register file.
     radix = min(radix, 2 ** (limit.bit_length() - 1))
@@ -452,8 +550,9 @@ def construct(p, radix, order, deep_deadline=0):
             emit('+', digit - 2, 0, digit - 1)
     emit('+', radix // 2 - 1, radix // 2 - 1, radix // 2)
 
+    cache = PrefixCache(order, radix) if retain_prefixes else None
     cursor = 0
-    for target in order:
+    for position, target in enumerate(order):
         if target not in remaining:
             continue
         dest = protected_count + cursor % (47 - protected_count)
@@ -464,8 +563,11 @@ def construct(p, radix, order, deep_deadline=0):
                              range(protected_count), min(deep_deadline, time.monotonic() + 0.06))
             if plan is not None and len(plan) < len(best):
                 best = plan
-        for op, i, j, d in best:
-            emit(op, i, j, d)
+        if cache is None:
+            for op, i, j, d in best:
+                emit(op, i, j, d)
+        else:
+            cache.apply(best, regs, protected_count, position, emit, limit)
         if len(out) > 4096:
             return None
     return out if not remaining else None
@@ -562,6 +664,45 @@ def optimize(p, old, deadline, rng):
 def smoke_checks():
     """Exercise signed borrows, exact-limit overshoots, and scratch aliasing."""
     rng = random.Random(914103)
+    # The first target computes a long prefix used by a smaller later target.
+    # Its original one-scratch construction discards that intermediate.
+    shared = 12345678921
+    puzzle = dict(start=[1], targets=[shared * 32**2 + 17, shared * 32 + 19],
+                  limit=10**16)
+    old = construct(puzzle, 32, puzzle['targets'], retain_prefixes=False)
+    new = construct(puzzle, 32, puzzle['targets'])
+    assert replay(puzzle, old) and replay(puzzle, new)
+    assert len(new) < len(old), (len(old), len(new))
+    print('Shared-prefix construction:', len(old), '->', len(new), flush=True)
+    # Full register file, destructive source aliases, and a repeated value
+    # exercise pinning across writes and the zero-instruction resident reuse.
+    for radix in (4, 16, 64):
+        protected = radix // 2 + 1
+        regs = list(range(1, radix // 2 + 1)) + [radix]
+        regs += list(range(101, 101 + 48 - len(regs)))
+        initial = regs[:]
+        d = protected
+        plan = [['+', d, 0, 47], ['*', 47, d, d],
+                ['-', d, 47, 47], ['+', 0, 0, d], ['+', 47, d, d]]
+        logical = regs[:]
+        for op, i, j, dest in plan:
+            logical[dest] = calc(op, logical[i], logical[j], 10**18)
+            assert logical[dest] is not None
+        emitted = []
+
+        def emit(op, i, j, dest):
+            value = calc(op, regs[i], regs[j], 10**18)
+            assert value is not None
+            regs[dest] = value
+            emitted.append([op, i, j, dest])
+
+        cache = PrefixCache([logical[d], logical[d] + 100], radix)
+        cache.apply(plan, regs, protected, 0, emit, 10**18)
+        assert logical[d] in regs
+        assert regs[:protected] == initial[:protected]
+        assert len(emitted) < len(plan)
+        assert replay(dict(start=initial, targets=[logical[d]], limit=10**18), emitted)
+    print('Prefix-cache allocation checks passed: 3', flush=True)
     checks = 0
     fallback_checks = 0
     # No radix dictionary and no cached prefix besides 1: the fallback must
@@ -706,6 +847,18 @@ def main():
             plan = construct(puzzle, radix, order)
             assert plan is not None and replay(puzzle, plan), ('scored_0006', radix)
         print('scored_0006 construction checks passed: 5 radices', flush=True)
+    if o['smoke']:
+        before = after = 0
+        for pid in sorted(puzzles)[:6]:
+            puzzle = puzzles[pid]
+            order = sorted(set(puzzle['targets']) - set(puzzle['start']))
+            old = construct(puzzle, 32, order, retain_prefixes=False)
+            new = construct(puzzle, 32, order)
+            assert replay(puzzle, old) and replay(puzzle, new)
+            before += len(old)
+            after += len(new)
+            print('Matched radix-32', pid, len(old), '->', len(new), flush=True)
+        print('Matched constructor total:', before, '->', after, flush=True)
     with Path(o['best'] or locate('sample_submission.csv')).open(newline='', encoding='utf-8') as f:
         current = {r['id']: json.loads(r['program']) for r in csv.DictReader(f)}
     ids = sorted(puzzles)[:6] if o['smoke'] else sorted(puzzles)
