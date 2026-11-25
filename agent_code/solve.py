@@ -1,14 +1,14 @@
-"""Incumbent-guided arithmetic DAG rewrites with target-order annealing.
+"""Target-indexed E1 x E1 DAG rewrites with retained register intermediates.
 
-Search a larger neighborhood than instruction deletion: every intermediate may
-use any equivalent one-operation recipe over earlier incumbent values. Rebuild
-only the union of dependencies needed by the targets, then allocate 48 physical
-registers. An independent replay guards every accepted improvement.
+An incumbent remains the fallback. Replace an exclusive dependency cone only
+when its exact union of required instructions becomes smaller.
+E1 contains every legal one-operation value over the current physical cache.
+Inverse arithmetic joins two E1 entries, optionally under one more E1 operation,
+finding expressions of up to five operations without a quadratic E1 product.
 """
 import csv
 import heapq
 import json
-import math
 import random
 import time
 from pathlib import Path
@@ -18,410 +18,463 @@ from kaggle_agent import toolkit as kt
 
 def calc(op, a, b, limit):
     if op == '+':
-        value = a + b
+        v = a + b
     elif op == '-':
-        value = a - b
+        v = a - b
     elif op == '*':
-        value = a * b
+        v = a * b
     elif op == '/' and b and a % b == 0:
-        value = a // b
+        v = a // b
     else:
         return None
-    return value if 0 < value <= limit else None
+    return v if 0 < v <= limit else None
 
 
 def replay(p, program):
-    """Check all official per-program constraints, including serialized size."""
     if not isinstance(program, list) or len(program) > 4096:
         return False
-    if len(json.dumps(program, separators=(',', ':')).encode('utf-8')) > 131072:
+    if len(json.dumps(program, separators=(',', ':')).encode()) > 131072:
         return False
     regs = list(p['start']) + [None] * (48 - len(p['start']))
     remaining = set(p['targets']) - set(p['start'])
-    for instruction in program:
-        if not isinstance(instruction, list) or len(instruction) != 4:
+    for ins in program:
+        if not isinstance(ins, list) or len(ins) != 4:
             return False
-        op, i, j, d = instruction
+        op, i, j, d = ins
         if op not in ('+', '-', '*', '/'):
             return False
         if any(type(r) is not int or not 0 <= r < 48 for r in (i, j, d)):
             return False
         if regs[i] is None or regs[j] is None:
             return False
-        value = calc(op, regs[i], regs[j], p['limit'])
-        if value is None:
+        v = calc(op, regs[i], regs[j], p['limit'])
+        if v is None:
             return False
-        regs[d] = value
-        remaining.discard(value)
+        regs[d] = v
+        remaining.discard(v)
     return not remaining
 
 
-class RewriteSpace:
-    def __init__(self, p, program, deadline):
+def inverses(t, b, limit):
+    """(left op right)=t with one operand b; return other value and order."""
+    if t > b:
+        yield t - b, '+', False
+    if t + b <= limit:
+        yield t + b, '-', False
+    if b > t:
+        yield b - t, '-', True
+    if t % b == 0:
+        yield t // b, '*', False
+    if b <= limit // t:
+        yield t * b, '/', False
+    if b % t == 0:
+        yield b // t, '/', True
+
+
+def combine(op, a, b, reverse):
+    return (op, b, a) if reverse else (op, a, b)
+
+
+def expression_cost(expr):
+    seen = set()
+
+    def visit(e):
+        if isinstance(e, int) or e in seen:
+            return
+        seen.add(e)
+        visit(e[1])
+        visit(e[2])
+    visit(expr)
+    return len(seen)
+
+
+class Frontier:
+    def __init__(self, regs, limit):
+        self.limit = limit
+        self.base = {}
+        for r, v in enumerate(regs):
+            if v is not None:
+                self.base.setdefault(v, r)
+        self.e1 = self.base.copy()
+        vals = list(self.base.items())
+        # Immutable expression tuples permit exact shared-intermediate reuse.
+        for i, (a, ar) in enumerate(vals):
+            for b, br in vals[i:]:
+                for op, x, y, xr, yr in (
+                    ('+', a, b, ar, br), ('*', a, b, ar, br),
+                    ('-', a, b, ar, br), ('-', b, a, br, ar),
+                    ('/', a, b, ar, br), ('/', b, a, br, ar)):
+                    v = calc(op, x, y, limit)
+                    if v is not None and v not in self.e1:
+                        self.e1[v] = (op, xr, yr)
+        self.items = list(self.e1.items())
+        self.memo = {}
+
+    def join(self, t, deadline):
+        if not 0 < t <= self.limit:
+            return None
+        if t in self.e1:
+            return self.e1[t]
+        if t in self.memo:
+            return self.memo[t]
+        best = None
+        best_cost = 4
+        for k, (b, be) in enumerate(self.items):
+            if k % 256 == 0 and time.monotonic() >= deadline:
+                return best
+            for a, op, reverse in inverses(t, b, self.limit):
+                ae = self.e1.get(a)
+                if ae is None:
+                    continue
+                expr = combine(op, ae, be, reverse)
+                cost = expression_cost(expr)
+                if cost < best_cost:
+                    best, best_cost = expr, cost
+                    if cost <= 2:
+                        self.memo[t] = best
+                        return best
+        self.memo[t] = best
+        return best
+
+    def find(self, t, max_cost, deadline):
+        best = self.join(t, deadline)
+        cost = expression_cost(best) if best is not None else max_cost + 1
+        if cost <= 3 or time.monotonic() >= deadline:
+            return best if cost <= max_cost else None
+        # First lift a three-operation E1 x E1 join under a cached value (4
+        # steps). Then lift it under a one-operation value (5 steps). Probe
+        # a bounded, diverse E1 subset rather than materializing E1 squared.
+        outer = list(self.base.items())
+        extras = [(v, e) for v, e in self.items if v not in self.base]
+        extras.sort(key=lambda ve: (abs(ve[0].bit_length() - t.bit_length() // 2), ve[0]))
+        if extras:
+            stride = max(1, len(extras) // 24)
+            probes = extras[:24] + extras[::stride][:24]
+            outer += probes
+        for b, be in outer:
+            if time.monotonic() >= deadline:
+                break
+            outer_cost = 0 if isinstance(be, int) else 1
+            if outer_cost + 2 > min(max_cost, cost - 1):
+                continue
+            for a, op, reverse in inverses(t, b, self.limit):
+                ae = self.join(a, deadline)
+                if ae is None:
+                    continue
+                expr = combine(op, ae, be, reverse)
+                n = expression_cost(expr)
+                if n < cost and n <= max_cost:
+                    best, cost = expr, n
+            if cost <= 3:
+                break
+        return best if cost <= max_cost else None
+
+
+class ArithmeticDAG:
+    """Value DAG plus an exact closure/register allocator for new MITM nodes."""
+    def __init__(self, p, program):
         self.values = []
-        self.index = {}
+        self.recipes = []
         self.initial = {}
-        self.original = []
-
-        def add(value, recipe=None):
-            previous = self.index.get(value)
-            if previous is not None:
-                return previous
-            node = len(self.values)
-            self.index[value] = node
-            self.values.append(value)
-            self.original.append(recipe)
-            return node
-
+        self.rank = []
+        index = {}
         regs = [None] * 48
-        for r, value in enumerate(p['start']):
-            node = add(value)
-            self.initial.setdefault(node, r)
-            regs[r] = node
+
+        def add(v, recipe=None):
+            if v in index:
+                return index[v]
+            n = len(self.values)
+            index[v] = n
+            self.values.append(v)
+            self.recipes.append(recipe)
+            self.rank.append(float(n))
+            return n
+
+        for r, v in enumerate(p['start']):
+            n = add(v)
+            self.initial.setdefault(n, r)
+            regs[r] = n
         for op, i, j, d in program:
             a, b = regs[i], regs[j]
-            value = calc(op, self.values[a], self.values[b], p['limit'])
-            regs[d] = add(value, (op, a, b))
+            v = calc(op, self.values[a], self.values[b], p['limit'])
+            regs[d] = add(v, (op, a, b))
+        self.roots = sorted({index[t] for t in p['targets']})
 
-        self.roots = sorted({self.index[t] for t in p['targets']}
-                            - self.initial.keys())
-        self.recipes = [[] for _ in self.values]
-        closures = [0] * len(self.values)
-        # The original recipe is always retained. Alternatives strictly point
-        # backwards in first-occurrence order, so every candidate stays acyclic.
-        self.alternatives = 0
-        for node, value in enumerate(self.values):
-            if node in self.initial:
-                continue
-            original = self.original[node]
-            candidates = {original}
-            if time.monotonic() < deadline:
-                for a, av in enumerate(self.values[:node]):
-                    possibilities = [('+', value - av, a, False),
-                                     ('-', av - value, a, False),
-                                     ('-', av + value, a, True)]
-                    if value % av == 0:
-                        possibilities.append(('*', value // av, a, False))
-                    if av % value == 0:
-                        possibilities.append(('/', av // value, a, False))
-                    if av <= p['limit'] // value:
-                        possibilities.append(('/', av * value, a, True))
-                    for op, bv, left, reverse in possibilities:
-                        b = self.index.get(bv)
-                        if b is None or b >= node:
-                            continue
-                        left, right = (b, left) if reverse else (left, b)
-                        if op in ('+', '*') and left > right:
-                            left, right = right, left
-                        candidates.add((op, left, right))
+    def closure(self):
+        selected = set()
+        active = set()
 
-            def rank(recipe):
-                _, a, b = recipe
-                return ((closures[a] | closures[b]).bit_count(),
-                        recipe != original, max(a, b), recipe)
+        def visit(n):
+            if n in self.initial or n in selected:
+                return
+            if n in active:
+                raise ValueError('cyclic rewrite')
+            active.add(n)
+            _, a, b = self.recipes[n]
+            visit(a)
+            visit(b)
+            active.remove(n)
+            selected.add(n)
+        for root in self.roots:
+            visit(root)
+        return selected
 
-            ranked = sorted(candidates, key=rank)
-            # Keep diverse direct recipes, rather than an unbounded quadratic
-            # frontier of expensive ways to compute the same small constant.
-            keep = ranked[:24]
-            if original not in keep:
-                keep.append(original)
-            self.recipes[node] = keep
-            _, a, b = ranked[0]
-            closures[node] = closures[a] | closures[b] | (1 << node)
-            self.alternatives += len(keep) - 1
-
-    def choose(self, order, tie_seed=0):
-        """Build target closures against the nodes selected for earlier targets.
-
-        Bit masks count shared intermediate nodes exactly once. Recomputing the
-        forward choices after each target makes already selected work free.
-        """
-        count = len(self.values)
-        selected = 0
-        choices = [None] * count
-        # A small deterministic tie perturbation gives the order search access
-        # to different equal-cost shared subgraphs without changing the metric.
-        for root in order:
-            if selected & (1 << root):
-                continue
-            masks = [0] * (root + 1)
-            local = [None] * (root + 1)
-            for node in range(root + 1):
-                if node in self.initial or selected & (1 << node):
-                    continue
-                winner = None
-                best_key = None
-                best_mask = 0
-                for ri, recipe in enumerate(self.recipes[node]):
-                    _, a, b = recipe
-                    mask = masks[a] | masks[b] | (1 << node)
-                    tie = ((ri * 2654435761 + node * 2246822519 + tie_seed)
-                           ^ (tie_seed * (ri + 1))) & 0xffff if tie_seed else ri
-                    key = (mask.bit_count(), tie)
-                    if best_key is None or key < best_key:
-                        best_key, best_mask, winner = key, mask, recipe
-                masks[node] = best_mask
-                local[node] = winner
-            new = masks[root]
-            pending = new
-            while pending:
-                bit = pending & -pending
-                node = bit.bit_length() - 1
-                choices[node] = local[node]
-                pending ^= bit
-            selected |= new
-        return self.allocate(choices, selected)
-
-    def original_program(self):
-        choices = self.original[:]
-        selected = 0
-        todo = self.roots[:]
-        while todo:
-            node = todo.pop()
-            if node in self.initial or selected & (1 << node):
-                continue
-            selected |= 1 << node
-            _, a, b = choices[node]
-            todo.extend((a, b))
-        return self.allocate(choices, selected)
-
-    def allocate(self, choices, selected):
-        """Schedule the chosen DAG, freeing registers on the last source read."""
-        nodes = []
-        pending = selected
-        while pending:
-            bit = pending & -pending
-            nodes.append(bit.bit_length() - 1)
-            pending ^= bit
+    def allocate(self, selected):
         uses = [0] * len(self.values)
         users = [[] for _ in self.values]
-        dependencies = {}
-        for node in nodes:
-            _, a, b = choices[node]
-            operands = set((a, b))
-            dependencies[node] = sum(v not in self.initial for v in operands)
-            for operand in operands:
-                uses[operand] += 1
-                users[operand].append(node)
-        physical = {node: r for node, r in self.initial.items() if uses[node]}
-        occupied = set(physical.values())
-        free = set(range(48)) - occupied
-        ready = [node for node in nodes if dependencies[node] == 0]
+        deps = {}
+        for n in selected:
+            sources = set(self.recipes[n][1:])
+            deps[n] = sum(a not in self.initial for a in sources)
+            for a in sources:
+                uses[a] += 1
+                users[a].append(n)
+        physical = {n: r for n, r in self.initial.items() if uses[n]}
+        free = set(range(48)) - set(physical.values())
+        ready = [(self.rank[n], n) for n in selected if not deps[n]]
         heapq.heapify(ready)
         out = []
         while ready:
             if len(free) <= 3:
-                # Under pressure, consume a dying source before opening a new
-                # live range. The ordinary schedule follows incumbent order.
-                node = min(ready, key=lambda n: (
-                    1 - sum(uses[a] == 1 for a in set(choices[n][1:])), n))
-                ready.remove(node)
+                pos = min(range(len(ready)), key=lambda k: (
+                    -sum(uses[a] == 1 for a in set(self.recipes[ready[k][1]][1:])),
+                    ready[k][0]))
+                _, n = ready.pop(pos)
                 heapq.heapify(ready)
             else:
-                node = heapq.heappop(ready)
-            op, a, b = choices[node]
+                _, n = heapq.heappop(ready)
+            op, a, b = self.recipes[n]
             i, j = physical[a], physical[b]
-            dying = [operand for operand in set((a, b)) if uses[operand] == 1]
+            dying = [v for v in set((a, b)) if uses[v] == 1]
             if dying:
-                d = min(physical[operand] for operand in dying)
+                d = min(physical[v] for v in dying)
             elif free:
                 d = min(free)
             else:
                 return None
             out.append([op, i, j, d])
-            for operand in set((a, b)):
-                uses[operand] -= 1
-                if uses[operand] == 0:
-                    free.add(physical.pop(operand))
+            for v in set((a, b)):
+                uses[v] -= 1
+                if uses[v] == 0:
+                    free.add(physical.pop(v))
             free.discard(d)
-            if uses[node]:
-                physical[node] = d
+            if uses[n]:
+                physical[n] = d
             else:
-                # A target's appearance covers it permanently, so it needs no
-                # lifetime after its final arithmetic consumer has executed.
                 free.add(d)
-            for user in users[node]:
-                dependencies[user] -= 1
-                if dependencies[user] == 0:
-                    heapq.heappush(ready, user)
-        return out if len(out) == len(nodes) else None
+            for user in users[n]:
+                deps[user] -= 1
+                if deps[user] == 0:
+                    heapq.heappush(ready, (self.rank[user], user))
+        return out if len(out) == len(selected) else None
+
+    def exclusive_cone(self, root, selected, uses):
+        counts = uses.copy()
+        removed = {root}
+        pending = [root]
+        protected = set(self.roots) - {root}
+        while pending:
+            n = pending.pop()
+            for a in set(self.recipes[n][1:]):
+                counts[a] -= 1
+                if (counts[a] == 0 and a in selected and a not in protected
+                        and a not in removed):
+                    removed.add(a)
+                    pending.append(a)
+        return removed
+
+    def install(self, root, expr, bases, limit):
+        """New immutable nodes retain shared expressions without value aliasing."""
+        memo = {}
+
+        def node(e):
+            if isinstance(e, int):
+                return bases[e]
+            if e in memo:
+                return memo[e]
+            op, ae, be = e
+            a, b = node(ae), node(be)
+            n = len(self.values)
+            self.values.append(calc(op, self.values[a], self.values[b], limit))
+            self.recipes.append((op, a, b))
+            self.rank.append(self.rank[root] - .5 + len(memo) * .0001)
+            memo[e] = n
+            return n
+        if isinstance(expr, int):
+            return False
+        op, a, b = expr
+        self.recipes[root] = (op, node(a), node(b))
+        return True
 
 
-def mutate(order, rng):
-    trial = order[:]
-    if len(trial) < 2:
-        return trial
-    a, b = sorted(rng.sample(range(len(trial)), 2))
-    kind = rng.randrange(4)
-    if kind == 0:
-        trial[a], trial[b] = trial[b], trial[a]
-    elif kind == 1:
-        trial.insert(a, trial.pop(b))
-    elif kind == 2:
-        trial[a:b + 1] = reversed(trial[a:b + 1])
-    else:
-        block = trial[a:b + 1]
-        del trial[a:b + 1]
-        pos = rng.randrange(len(trial) + 1)
-        trial[pos:pos] = block
-    return trial
-
-
-def optimize(p, old, deadline, rng):
-    best = old
-    space = RewriteSpace(p, old, deadline)
-    attempts = 0
-
-    def consider(candidate):
-        nonlocal best, attempts
-        attempts += 1
-        if candidate is not None and len(candidate) < len(best) and replay(p, candidate):
-            best = candidate
-
-    consider(space.original_program())
-    if not space.roots:
-        return best, attempts, space.alternatives
-    order = space.roots[::-1]
-    current_cost = len(old)
-    elite_order = order[:]
-    elite_cost = current_cost
-    begin = time.monotonic()
-    stale = 0
-    iteration = 0
+def optimize(p, old, deadline):
+    """Apply deeper joins to exclusive dependency cones, even if interleaved."""
+    dag = ArithmeticDAG(p, old)
+    selected = dag.closure()
+    candidate = dag.allocate(selected)
+    best = candidate if candidate is not None and replay(p, candidate) and len(candidate) < len(old) else old
+    hits = 0
+    attempted = set()
     while time.monotonic() < deadline:
-        if iteration == 0:
-            trial = space.roots[::-1]
-        elif iteration == 1:
-            trial = space.roots[:]
-        elif iteration == 2:
-            trial = sorted(space.roots, key=lambda n: space.values[n] % 65536)
-        else:
-            trial = mutate(order, rng)
-        candidate = space.choose(trial, 0 if iteration < 3 else rng.getrandbits(16))
-        consider(candidate)
-        score = len(candidate) if candidate is not None else len(old) + 100
-        progress = (time.monotonic() - begin) / max(0.001, deadline - begin)
-        temperature = max(0.15, 2.5 * (1 - progress))
-        if score <= current_cost or rng.random() < math.exp(min(0, (current_cost - score) / temperature)):
-            current_cost, order = score, trial
-        if score < elite_cost:
-            elite_cost, elite_order, stale = score, trial[:], 0
-        else:
-            stale += 1
-        if stale >= 12:
-            current_cost, order, stale = elite_cost, elite_order[:], 0
-        iteration += 1
-        # One operation per target absent from the starting values is the
-        # official lower bound; no further neighborhood can improve it.
-        if len(best) == len(space.roots):
+        selected = dag.closure()
+        uses = [0] * len(dag.values)
+        users = [[] for _ in dag.values]
+        for n in selected:
+            for a in set(dag.recipes[n][1:]):
+                uses[a] += 1
+                users[a].append(n)
+        candidates = []
+        for root in selected:
+            if root in dag.initial or root in attempted:
+                continue
+            cone = dag.exclusive_cone(root, selected, uses)
+            if len(cone) >= 3:
+                candidates.append((len(cone), root, cone))
+        if not candidates:
             break
-    return best, attempts, space.alternatives
+        # Small internal cones often expose cheap arithmetic that target-only
+        # search misses. Mix them with large target cones rather than spending
+        # the entire budget on the largest, most difficult target values.
+        candidates.sort(key=lambda item: (
+            -min(item[0], 10), dag.values[item[1]].bit_length(), item[1]))
+        size, root, cone = candidates[0]
+        attempted.add(root)
+        # All bases are already required outside the removed cone. Their cost
+        # is free in the exact union of dependencies, not an approximate score.
+        descendants = {root}
+        pending = [root]
+        while pending:
+            for user in users[pending.pop()]:
+                if user not in descendants:
+                    descendants.add(user)
+                    pending.append(user)
+        available = [n for n in (selected - cone) | set(dag.initial)
+                     if n not in descendants and dag.rank[n] < dag.rank[root]]
+        available.sort(key=lambda n: (n not in dag.initial,
+                                      -uses[n], -dag.rank[n]))
+        bases = available[:48]
+        if not bases:
+            continue
+        regs = [dag.values[n] for n in bases] + [None] * (48 - len(bases))
+        share = (deadline - time.monotonic()) / max(1, min(8, len(candidates)))
+        local_deadline = min(deadline, time.monotonic() + max(.006, share))
+        frontier = Frontier(regs, p['limit'])
+        expr = frontier.find(dag.values[root], min(5, size - 1), local_deadline)
+        if expr is None:
+            continue
+        previous = dag.recipes[root]
+        count = len(dag.values)
+        if not dag.install(root, expr, bases, p['limit']):
+            continue
+        trial_selected = dag.closure()
+        trial = dag.allocate(trial_selected) if len(trial_selected) < len(best) else None
+        if trial is not None and len(trial) < len(best) and replay(p, trial):
+            best = trial
+            hits += 1
+            # Other targets can now reuse the newly retained intermediates.
+            attempted.clear()
+        else:
+            dag.recipes[root] = previous
+            del dag.values[count:]
+            del dag.recipes[count:]
+            del dag.rank[count:]
+    return best, hits
 
 
 def smoke_checks():
-    # Producing 41 by a 3-step branch hides the alternative 50-9. Replacing
-    # that entire dependency cone is impossible by single-instruction deletion.
-    p = dict(start=[50, 9, 1], targets=[41, 82], limit=1000)
-    old = [['+', 2, 2, 3], ['*', 3, 1, 4], ['+', 4, 4, 5],
-           ['+', 5, 3, 6], ['+', 6, 3, 7], ['+', 7, 2, 8],
-           ['+', 8, 8, 9]]
+    # Independent E1 branches below another E1 branch exercise genuine
+    # four/five-operation plans and eliminate a longer incumbent cone.
+    for target in (((101 * 109) + (127 * 137)) * 101,
+                   ((101 * 109) + (127 * 137)) * (101 + 109)):
+        puzzle = dict(start=[101, 109, 127, 137], targets=[target], limit=10**9)
+        trace = [['/', 0, 0, 4], ['/', 0, 0, 5]]
+        for bit in bin(target)[3:]:
+            trace.append(['+', 5, 5, 5])
+            if bit == '1':
+                trace.append(['+', 5, 4, 5])
+        assert replay(puzzle, trace)
+        new, hits = optimize(puzzle, trace, time.monotonic() + .25)
+        assert replay(puzzle, new) and len(new) <= 5 and hits, (target, len(new))
+        print('Deeper E1 x E1 cone:', len(trace), '->', len(new), flush=True)
+    # Equal E1 branches share one immutable intermediate in the final DAG.
+    p = dict(start=[11, 7, 13, 5], targets=[324, 331], limit=10000)
+    old = [['+', 0, 1, 4], ['+', 2, 3, 5], ['*', 4, 5, 6],
+           ['+', 6, 1, 7]]
     assert replay(p, old)
-    space = RewriteSpace(p, old, time.monotonic() + 1)
-    new = space.choose(space.roots[::-1])
-    assert replay(p, new) and len(new) == 2, new
-    print('Arithmetic cone rewrite:', len(old), '->', len(new), flush=True)
-    # Exact division, destructive aliases, duplicate values, initially covered
-    # targets and full-register pressure are all legal calculator behaviors.
-    cases = [
-        (dict(start=[3], targets=[1, 2, 5, 8], limit=9),
-         [['/', 0, 0, 1], ['-', 0, 1, 2], ['+', 0, 2, 3], ['+', 0, 3, 4]]),
-        (dict(start=[2, 2, 7], targets=[2, 14, 1], limit=14),
-         [['*', 0, 2, 2], ['/', 1, 1, 0]]),
-        (dict(start=list(range(1, 49)), targets=[96, 47, 2], limit=96),
-         [['+', 47, 47, 47], ['/', 47, 23, 0], ['-', 47, 0, 1]]),
-        (dict(start=[1], targets=[1], limit=1), []),
-    ]
-    for puzzle, program in cases:
-        assert replay(puzzle, program)
-        graph = RewriteSpace(puzzle, program, time.monotonic() + 1)
-        for order in (graph.roots, graph.roots[::-1]):
-            candidate = graph.choose(order)
-            assert candidate is not None and replay(puzzle, candidate)
-        candidate = graph.original_program()
-        assert candidate is not None and replay(puzzle, candidate)
-    # Random traces exercise lifetime allocation with arbitrary source writes.
-    rng = random.Random(63743)
+    regs = p['start'] + [None] * 44
+    f = Frontier(regs, p['limit'])
+    e = f.find(324, 5, time.monotonic() + .3)
+    dag = ArithmeticDAG(p, old)
+    root = next(n for n in dag.roots if dag.values[n] == 324)
+    dag.install(root, e, list(range(4)), p['limit'])
+    ins = dag.allocate(dag.closure())
+    assert ins is not None and replay(p, ins) and len(ins) == 3
+    print('Shared E1 branches and retained intermediate check passed', flush=True)
+    # Replay random valid incumbent traces and test live-out preservation.
+    rng = random.Random(914)
     for full in (False, True):
-        for _ in range(12):
+        for _ in range(6):
             start = list(range(1, 49)) if full else [3, 5, 7]
             regs = start[:] + [None] * (48 - len(start))
-            program = []
-            targets = set(start[:2])
-            for step in range(75):
-                live = [r for r in range(48) if regs[r] is not None]
-                i, j = rng.choice(live), rng.choice(live)
+            trace = []
+            targets = set(start[:1])
+            for k in range(45):
+                defined = [r for r, v in enumerate(regs) if v is not None]
+                i, j = rng.choice(defined), rng.choice(defined)
                 op = rng.choice(('+', '-', '*', '/'))
-                value = calc(op, regs[i], regs[j], 10**8)
-                if value is None:
+                v = calc(op, regs[i], regs[j], 10**9)
+                if v is None:
                     continue
                 d = rng.randrange(48)
-                program.append([op, i, j, d])
-                regs[d] = value
-                if step % 9 == 0:
-                    targets.add(value)
-            puzzle = dict(start=start, targets=sorted(targets), limit=10**8)
-            assert replay(puzzle, program)
-            graph = RewriteSpace(puzzle, program, time.monotonic() + 1)
-            for order in (graph.roots, graph.roots[::-1]):
-                candidate = graph.choose(order, rng.getrandbits(16))
-                assert candidate is None or replay(puzzle, candidate)
-    print('DAG replay and allocation checks passed', flush=True)
+                regs[d] = v
+                trace.append([op, i, j, d])
+                if k % 8 == 0:
+                    targets.add(v)
+            puzzle = dict(start=start, targets=sorted(targets), limit=10**9)
+            assert replay(puzzle, trace)
+            new, _ = optimize(puzzle, trace, time.monotonic() + .015)
+            assert replay(puzzle, new) and len(new) <= len(trace)
+    print('Destructive aliases, exact division and liveness checks passed', flush=True)
 
 
 def main():
-    options = kt.optimization()
-    if options['smoke']:
+    o = kt.optimization()
+    if o['smoke']:
         smoke_checks()
-    data = Path(options['data_dir'])
+    data = Path(o['data_dir'])
 
     def locate(name):
         nested = data / 'data' / name
         return nested if nested.is_file() else data / name
 
     with locate('puzzles.csv').open(newline='', encoding='utf-8') as f:
-        puzzles = {row['id']: dict(start=json.loads(row['starting_values']),
-                                   targets=json.loads(row['targets']),
-                                   limit=int(row['value_limit']))
-                   for row in csv.DictReader(f)}
-    with Path(options['best'] or locate('sample_submission.csv')).open(newline='', encoding='utf-8') as f:
-        current = {row['id']: json.loads(row['program']) for row in csv.DictReader(f)}
-    # Preserve every untouched puzzle, and refuse to start from invalid input.
+        puzzles = {r['id']: dict(start=json.loads(r['starting_values']),
+                                  targets=json.loads(r['targets']),
+                                  limit=int(r['value_limit'])) for r in csv.DictReader(f)}
+    with Path(o['best'] or locate('sample_submission.csv')).open(newline='', encoding='utf-8') as f:
+        current = {r['id']: json.loads(r['program']) for r in csv.DictReader(f)}
     if set(current) != set(puzzles):
-        raise ValueError('baseline puzzle IDs do not match data')
-    for pid, puzzle in puzzles.items():
-        if not replay(puzzle, current[pid]):
+        raise ValueError('baseline IDs do not match puzzles')
+    for pid, p in puzzles.items():
+        if not replay(p, current[pid]):
             raise ValueError('invalid baseline: ' + pid)
-    ids = sorted(puzzles)[:6] if options['smoke'] else sorted(puzzles)
-    rng = random.Random(options['seed'])
+    ids = sorted(puzzles)[:6] if o['smoke'] else sorted(puzzles)
     before = sum(len(current[pid]) for pid in ids)
-    deadline = time.monotonic() + (4.0 if options['smoke'] else 3000.0)
-    for index, pid in enumerate(ids):
+    deadline = time.monotonic() + (4.0 if o['smoke'] else 3000.0)
+    for k, pid in enumerate(ids):
         old = current[pid]
-        allocation = max(0.0, deadline - time.monotonic()) / (len(ids) - index)
-        candidate, attempts, alternatives = optimize(
-            puzzles[pid], old, time.monotonic() + allocation, rng)
-        if len(candidate) < len(old) and replay(puzzles[pid], candidate):
-            current[pid] = candidate
-        print(pid, 'before', len(old), 'after', len(current[pid]),
-              'trials', attempts, 'alternative recipes', alternatives, flush=True)
-    out = Path(options['solution'])
+        share = max(0, deadline - time.monotonic()) / (len(ids) - k)
+        new, hits = optimize(puzzles[pid], old, time.monotonic() + share)
+        if len(new) < len(old) and replay(puzzles[pid], new):
+            current[pid] = new
+        print(pid, len(old), '->', len(current[pid]), 'MITM cones', hits, flush=True)
+    out = Path(o['solution'])
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open('w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['id', 'program'])
-        for pid, puzzle in sorted(puzzles.items()):
-            if not replay(puzzle, current[pid]):
+        for pid, p in sorted(puzzles.items()):
+            if not replay(p, current[pid]):
                 raise ValueError('invalid output: ' + pid)
             writer.writerow([pid, json.dumps(current[pid], separators=(',', ':'))])
     print('Validated', len(puzzles), 'puzzles; selected total', before, '->',
