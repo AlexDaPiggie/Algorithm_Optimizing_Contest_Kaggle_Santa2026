@@ -1,4 +1,4 @@
-"""Annealed target ordering with bidirectional cached-anchor residual moves."""
+"""Cached-anchor construction with target-indexed, register-retained E1 x E1 joins."""
 import csv
 import json
 import math
@@ -11,148 +11,196 @@ DEEP_STATS = {'calls': 0, 'e1xe1': 0, 'plans': 0, 'shared': 0}
 
 
 def deep_plan(regs, target, limit, bound, dest, protected, deadline):
-    """Join E1/E2 with E1/E2/E3; E3 contains operations on two E1s.
+    """Stream E1 x E1 into a backward target index before expanding E2.
 
-    Recipes refer to values rather than expression copies. Compiling their DAG
-    evaluates shared intermediates once and keeps them in actual registers.
+    Only matching E3 values need recipes. Nodes are immutable, so later cheaper
+    recipes cannot change a previously costed DAG or introduce a dependency cycle.
+    Each winning DAG is emitted once and its intermediates remain in registers.
     """
     if bound <= 1 or time.monotonic() >= deadline:
         return None
     DEEP_STATS['calls'] += 1
     base = {v: i for i, v in enumerate(regs) if v is not None}
-    recipe = {}
-    cost = {v: 0 for v in base}
-    work = {v: frozenset() for v in base}
+    nodes = []  # (value, op, left node, right node, arithmetic-node set)
+    lookup = {}
+    for value, register in base.items():
+        lookup[value] = len(nodes)
+        nodes.append((value, None, register, None, frozenset()))
 
-    def add(v, op, a, b, c):
-        if not 0 < v <= limit:
-            return
-        # Count shared arithmetic nodes once, including x*x and nested reuse.
-        if cost[a] and cost[b]:
-            c -= len(work[a] & work[b])
-        if c < cost.get(v, 99):
-            cost[v] = c
-            recipe[v] = (op, a, b)
-            work[v] = work[a] | work[b] | {v}
-
-    def expand(a, b, c):
-        add(a + b, '+', a, b, c)
-        add(a * b, '*', a, b, c)
-        if a > b:
-            add(a - b, '-', a, b, c)
-        elif b > a:
-            add(b - a, '-', b, a, c)
-        if a % b == 0:
-            add(a // b, '/', a, b, c)
-        if b % a == 0:
-            add(b // a, '/', b, a, c)
+    def append(value, op, a, b):
+        used = nodes[a][4] | nodes[b][4]
+        previous = lookup.get(value)
+        if previous is not None and len(nodes[previous][4]) <= len(used) + 1:
+            return previous
+        index = len(nodes)
+        nodes.append((value, op, a, b, used | {index}))
+        lookup[value] = index
+        return index
 
     values = sorted(base)
     for i, a in enumerate(values):
+        ai = lookup[a]
         for b in values[:i + 1]:
-            expand(a, b, 1)
-    e1 = tuple(cost)
+            bi = lookup[b]
+            if a + b <= limit:
+                append(a + b, '+', ai, bi)
+            if a * b <= limit:
+                append(a * b, '*', ai, bi)
+            if a > b:
+                append(a - b, '-', ai, bi)
+            if a % b == 0:
+                append(a // b, '/', ai, bi)
+            if b % a == 0:
+                append(b // a, '/', bi, ai)
+    e1 = dict(lookup)
+    best = lookup.get(target)
+    best_cost = len(nodes[best][4]) if best is not None else bound
 
-    def joins(left, right, maximum):
-        if target in cost:
-            return True
-        winner = None
-        winner_cost = min(bound, maximum + 1)
-        for a in left:
-            ca = cost[a]
-            if ca + 1 >= winner_cost:
+    def inverses(a):
+        return (('+', target - a, False),
+                ('-', a - target, False),
+                ('-', a + target, True),
+                ('*', target // a if target % a == 0 else 0, False),
+                ('/', a // target if a % target == 0 else 0, False),
+                ('/', a * target, True))
+
+    def consider(op, ai, bi):
+        nonlocal best, best_cost
+        cost = len(nodes[ai][4] | nodes[bi][4]) + 1
+        if cost < best_cost:
+            best = append(target, op, ai, bi)
+            best_cost = len(nodes[best][4])
+
+    def join(frontier):
+        for a, ai in frontier.items():
+            if len(nodes[ai][4]) + 1 >= best_cost:
                 continue
-            candidates = (('+', target - a, False),
-                          ('-', a - target, False),
-                          ('-', a + target, True),
-                          ('*', target // a if target % a == 0 else 0, False),
-                          ('/', a // target if a % target == 0 else 0, False),
-                          ('/', a * target, True))
-            for op, b, reverse in candidates:
-                if b in right:
-                    c = ca + cost[b] + 1 - len(work[a] & work[b])
-                    if c < winner_cost:
-                        winner_cost = c
-                        winner = (op, b, a) if reverse else (op, a, b)
-        if winner is not None:
-            recipe[target] = winner
-            cost[target] = winner_cost
-            work[target] = work[winner[1]] | work[winner[2]] | {target}
-        return winner is not None
+            for op, b, reverse in inverses(a):
+                bi = frontier.get(b)
+                if bi is not None:
+                    consider(op, bi, ai) if reverse else consider(op, ai, bi)
 
-    # Cheap E1 x E1 join first (at most three operations).
-    if target not in cost:
-        joins(e1, cost, 3)
-    if target not in cost and bound > 3:
-        # Include the whole E1 frontier against live registers (E2).
-        for i, a in enumerate(e1):
-            if i % 64 == 0 and time.monotonic() >= deadline:
-                return None
+    if best is None:
+        join(e1)
+    if best_cost > 3 and bound > 3 and time.monotonic() < deadline:
+        # Index the E3 values that could finish a target with one E1 partner.
+        # This avoids storing tens of thousands of unhelpful E3 expressions.
+        wanted = {}
+        for a, ai in e1.items():
+            for op, b, reverse in inverses(a):
+                if 0 < b <= limit:
+                    wanted.setdefault(b, []).append((op, ai, reverse))
+
+        def probe(value, op, ai, bi):
+            if not 0 < value <= limit:
+                return
+            partners = wanted.get(value)
+            if partners is None:
+                return
+            used = nodes[ai][4] | nodes[bi][4]
+            existing = e1.get(value)
+            # The final partner can share either input E1. Count it only once.
+            for final_op, partner, reverse in partners:
+                work = nodes[existing][4] if existing is not None else used
+                cost = len(work | nodes[partner][4]) + (1 if existing is not None else 2)
+                if cost < best_cost:
+                    middle = existing if existing is not None else append(value, op, ai, bi)
+                    consider(final_op, middle, partner) if reverse else consider(final_op, partner, middle)
+
+        ordered = sorted(e1)
+        root = math.isqrt(target)
+        # Products of the largest live anchors are easy to miss in a numeric
+        # spread. Put their E1 recipes first, including both sides of ab+cd.
+        anchors = [v for v in values if v > 64][-8:]
+        seed_values = set()
+        for i, a in enumerate(anchors):
+            for b in anchors[:i + 1]:
+                seed_values.update((a + b, a * b, a - b))
+                if a % b == 0:
+                    seed_values.add(a // b)
+        seed_values.intersection_update(e1)
+        # A broad E1 pool, with extra small factors and values near sqrt(T).
+        pool = set(ordered[:40])
+        pool.update(sorted(ordered, key=lambda v: abs(v - root))[:40])
+        stride = max(1, len(ordered) // 64)
+        pool.update(ordered[::stride][:64])
+        pool = sorted(seed_values) + sorted(pool - seed_values)
+        DEEP_STATS['e1xe1'] += 1
+        for i, a in enumerate(pool):
+            if time.monotonic() >= deadline or (best is not None and best_cost <= 4):
+                break
+            ai = e1[a]
+            for b in pool[:i + 1]:
+                bi = e1[b]
+                probe(a + b, '+', ai, bi)
+                probe(a * b, '*', ai, bi)
+                if a > b:
+                    probe(a - b, '-', ai, bi)
+                if a % b == 0:
+                    probe(a // b, '/', ai, bi)
+                if b % a == 0:
+                    probe(b // a, '/', bi, ai)
+
+    if best_cost > 4 and bound > 4 and time.monotonic() < deadline:
+        # E2 x E2 covers the other five-operation tree shape. Even a partial
+        # frontier is joined if the deadline arrives during its construction.
+        for index, (a, ai) in enumerate(e1.items()):
+            if index % 8 == 0 and time.monotonic() >= deadline:
+                break
             for b in values:
-                expand(a, b, cost[a] + 1)
-        e2 = tuple(v for v in cost if cost[v] <= 2)
-        joins(e1, cost, 4)
-        if target not in cost and bound > 4:
-            joins(e2, cost, 5)
-        if target not in cost and bound > 4 and time.monotonic() < deadline:
-            DEEP_STATS['e1xe1'] += 1
-            # Bounded E1 x E1 level, distinct from E1 x register.
-            # Keep small factors, values near sqrt(target), and a broad spread.
-            ordered = sorted(e1)
-            pool = set(ordered[:64])
-            root = math.isqrt(target)
-            pool.update(sorted(e1, key=lambda v: abs(v - root))[:64])
-            stride = max(1, len(ordered) // 128)
-            pool.update(ordered[::stride][:128])
-            pool = sorted(pool)
-            for i, a in enumerate(pool):
-                if i % 16 == 0 and time.monotonic() >= deadline:
-                    return None
-                for b in pool[:i + 1]:
-                    expand(a, b, cost[a] + cost[b] + 1)
-            joins(e1, cost, 5)
-    if target not in cost or cost[target] >= bound:
-        return None
+                bi = e1[b]
+                if a + b <= limit:
+                    append(a + b, '+', ai, bi)
+                if a * b <= limit:
+                    append(a * b, '*', ai, bi)
+                if a > b:
+                    append(a - b, '-', ai, bi)
+                elif b > a:
+                    append(b - a, '-', bi, ai)
+                if a % b == 0:
+                    append(a // b, '/', ai, bi)
+                if b % a == 0:
+                    append(b // a, '/', bi, ai)
+        join({v: node for v, node in lookup.items() if len(nodes[node][4]) <= 2})
 
-    # Topological DAG and original leaves; no recipe ever reads an evicted leaf.
-    nodes = []
+    if best is None or best_cost >= bound:
+        return None
+    sequence = []
     seen = set()
     leaves = set()
 
-    def visit(v):
-        if v in seen:
+    def visit(index):
+        if index in seen:
             return
-        seen.add(v)
-        if v in base:
-            leaves.add(base[v])
+        seen.add(index)
+        _, op, a, b, _ = nodes[index]
+        if op is None:
+            leaves.add(a)
             return
-        op, a, b = recipe[v]
         visit(a)
         visit(b)
-        nodes.append((v, op, a, b))
+        sequence.append(index)
 
-    visit(target)
-    if not nodes or len(nodes) >= bound:
+    visit(best)
+    if len(sequence) >= bound:
         return None
-    DEEP_STATS['plans'] += 1
-    if any(a == b and a not in base for _, _, a, b in nodes):
-        DEEP_STATS['shared'] += 1
-    available = dict(base)
     allocated = set(protected) | leaves
+    available = {i: node[2] for i, node in enumerate(nodes) if node[1] is None}
+    slots = sorted(range(48), key=lambda i: (regs[i] is not None, i != 47, -i))
     plan = []
-    # Five operations need at most four intermediate slots. Keep their values
-    # after the target, making them anchors for subsequent target searches.
-    slots = sorted(range(48), key=lambda i: (regs[i] is not None, i != 47, i != dest, -i))
-    for index, (v, op, a, b) in enumerate(nodes):
-        if index == len(nodes) - 1:
-            d = dest
-        else:
-            d = next((i for i in slots if i not in allocated and i != dest), None)
-            if d is None:
-                return None
+    for index in sequence:
+        _, op, a, b, _ = nodes[index]
+        d = dest if index == best else next(
+            (r for r in slots if r not in allocated and r != dest), None)
+        if d is None:
+            return None
         plan.append([op, available[a], available[b], d])
         allocated.add(d)
-        available[v] = d
+        available[index] = d
+    DEEP_STATS['plans'] += 1
+    uses = [operand for index in sequence for operand in nodes[index][2:4]
+            if nodes[operand][1] is not None]
+    DEEP_STATS['shared'] += int(len(uses) != len(set(uses)))
     return plan
 
 
@@ -494,6 +542,35 @@ def smoke_checks():
     """Exercise signed borrows, exact-limit overshoots, and scratch aliasing."""
     rng = random.Random(914103)
     checks = 0
+    # E3 = (a*b + c*d), followed by an E1 partner; the first target reuses
+    # a*b. Both require the new level and all four intermediates can stay live.
+    initial = [101, 233, 487, 997]
+    ab, cd = initial[0] * initial[1], initial[2] * initial[3]
+    for target, maximum in (((ab + cd) * ab, 4),
+                            ((ab + cd) * (initial[0] + initial[2]), 5)):
+        for full in (False, True):
+            start_values = initial + (list(range(2, 46)) if full else [])
+            puzzle = dict(start=start_values, targets=[target], limit=10**18)
+            regs = start_values + [None] * (48 - len(start_values))
+            protected = range(4, 36) if full else ()
+            plan = deep_plan(regs, target, puzzle['limit'], maximum + 1,
+                             46, protected, time.monotonic() + 1)
+            assert plan is not None and len(plan) <= maximum, (target, full, plan)
+            assert replay(puzzle, plan), (puzzle, plan)
+            state = regs[:]
+            for op, i, j, d in plan:
+                state[d] = calc(op, state[i], state[j], puzzle['limit'])
+            assert state[46] == target
+            assert all(state[i] == regs[i] for i in protected)
+            assert len({ins[3] for ins in plan}) == len(plan)
+    # Shared p in (p*p)+p is a three-node DAG even though the expression tree
+    # has five nodes. It must also work when the incumbent has just four steps.
+    value = ab * ab + ab
+    puzzle = dict(start=initial, targets=[value], limit=value)
+    plan = deep_plan(initial + [None] * 44, value, value, 4, 46, (),
+                     time.monotonic() + 1)
+    assert plan is not None and len(plan) <= 3 and replay(puzzle, plan), plan
+    print('Retained E1 x E1 checks passed: 5', flush=True)
     # Residual 37 needs two Horner operations with this dictionary. The final
     # subtraction must read the preserved larger anchor, not overwritten dest.
     for target in (10**12, 10**18 - 40):
