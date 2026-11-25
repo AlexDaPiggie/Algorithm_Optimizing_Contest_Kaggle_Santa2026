@@ -1,4 +1,4 @@
-"""Annealed arithmetic recipe selection with small and large DAG moves.
+"""Incremental reference-count evaluation for annealed arithmetic DAG moves.
 
 Build targets around products of cached one-operation dictionary entries,
 then synthesize the signed residual. Preserve every shorter valid incumbent.
@@ -839,6 +839,172 @@ def smoke_checks():
 
 
 
+class IncrementalClosure:
+    """Exact active DAG maintained by reference counts, with reversible edits.
+
+    A root has one permanent reference. Each active instruction contributes
+    one reference per distinct operand. Crossing zero is the only event that
+    requires visiting descendants; initial values never count as instructions.
+    """
+    def __init__(self, recipes, roots, initial):
+        self.recipes = list(recipes)
+        self.initial = set(initial)
+        self.refs = [0] * len(recipes)
+        self.live = set()
+        for n in roots:
+            self._add(n)
+
+    def _add(self, n):
+        pending = [n]
+        refs, recipes, initial, live = self.refs, self.recipes, self.initial, self.live
+        while pending:
+            n = pending.pop()
+            refs[n] += 1
+            if refs[n] != 1 or n in initial:
+                continue
+            live.add(n)
+            _, a, b = recipes[n]
+            pending.append(a)
+            if b != a:
+                pending.append(b)
+
+    def _remove(self, n):
+        pending = [n]
+        refs, recipes, initial, live = self.refs, self.recipes, self.initial, self.live
+        while pending:
+            n = pending.pop()
+            refs[n] -= 1
+            if refs[n] or n in initial:
+                continue
+            live.remove(n)
+            _, a, b = recipes[n]
+            pending.append(a)
+            if b != a:
+                pending.append(b)
+
+    def replace(self, n, recipe):
+        previous = self.recipes[n]
+        if previous == recipe:
+            return previous
+        if self.refs[n] and n not in self.initial:
+            _, a, b = previous
+            _, x, y = recipe
+            # Add first so overlapping dependency cones stay active. Sources
+            # precede their destination, so propagation cannot visit n itself.
+            if x != a and x != b:
+                self._add(x)
+            if y != x and y != a and y != b:
+                self._add(y)
+            if a != x and a != y:
+                self._remove(a)
+            if b != a and b != x and b != y:
+                self._remove(b)
+        self.recipes[n] = recipe
+        return previous
+
+
+def incremental_checks():
+    """Differential test edits, rollback, aliases, roots and shared cones."""
+    rng = random.Random(834192)
+    size = 640
+    initial = {0, 1, 2, 3}
+    recipes = [None] * 4
+    pools = [[] for _ in range(size)]
+    for n in range(4, size):
+        for _ in range(4):
+            # A mixture of short edges, far edges and doubled sources.
+            a = rng.randrange(n)
+            b = a if rng.random() < .2 else rng.randrange(n)
+            pools[n].append(('+', a, b))
+        recipes.append(pools[n][0])
+    roots = list(range(size - 30, size)) + [0, 100, 200]
+
+    def reference(state):
+        live = set()
+        pending = list(roots)
+        while pending:
+            n = pending.pop()
+            if n in initial or n in live:
+                continue
+            live.add(n)
+            pending.extend(state[n][1:])
+        counts = [0] * size
+        for n in roots:
+            counts[n] += 1
+        for n in live:
+            _, a, b = state[n]
+            counts[a] += 1
+            if a != b:
+                counts[b] += 1
+        return live, counts
+
+    engine = IncrementalClosure(recipes, roots, initial)
+    moves = []
+    for k in range(1600):
+        active = sorted(engine.live)
+        edits = [(rng.choice(active) if active and rng.random() < .85
+                  else rng.randrange(4, size), None)
+                 for _ in range(1 if k % 5 else 6)]
+        edits = [(n, rng.choice(pools[n])) for n, _ in edits]
+        accept = rng.random() < .6
+        moves.append((edits, accept))
+        undo = []
+        for n, recipe in edits:
+            undo.append((n, engine.replace(n, recipe)))
+        live, refs = reference(engine.recipes)
+        assert engine.live == live and engine.refs == refs
+        if not accept:
+            for n, recipe in reversed(undo):
+                engine.replace(n, recipe)
+            live, refs = reference(engine.recipes)
+            assert engine.live == live and engine.refs == refs
+
+    def fast_run():
+        state = IncrementalClosure(recipes, roots, initial)
+        total = 0
+        for edits, accept in moves:
+            undo = [(n, state.replace(n, recipe)) for n, recipe in edits]
+            total += len(state.live)
+            if not accept:
+                for n, recipe in reversed(undo):
+                    state.replace(n, recipe)
+        return total, state.recipes
+
+    # Time the original closure-only traversal, excluding reference-count
+    # verification so the comparison reflects the actual replaced hot path.
+    def baseline_run():
+        current = list(recipes)
+        total = 0
+        for edits, accept in moves:
+            trial = list(current)
+            for n, recipe in edits:
+                trial[n] = recipe
+            seen = set()
+            pending = list(roots)
+            while pending:
+                n = pending.pop()
+                if n in initial or n in seen:
+                    continue
+                seen.add(n)
+                _, a, b = trial[n]
+                pending.append(a)
+                pending.append(b)
+            total += len(seen)
+            if accept:
+                current = trial
+        return total, current
+
+    start = time.perf_counter()
+    expected = baseline_run()
+    full_time = time.perf_counter() - start
+    start = time.perf_counter()
+    actual = fast_run()
+    fast_time = time.perf_counter() - start
+    assert actual == expected
+    print('Incremental closure: 1600 trials exactly matched; evaluation speedup',
+          round(full_time / max(fast_time, 1e-9), 2), 'x', flush=True)
+
+
 def anneal_recipes(p, old, deadline, rng):
     """Search whole dependency closures, including neutral and uphill moves.
 
@@ -907,19 +1073,6 @@ def anneal_recipes(p, old, deadline, rng):
     roots = dag.roots
     initial_mask = sum(1 << n for n in initial)
 
-    def closure(recipes):
-        seen = set()
-        pending = list(roots)
-        while pending:
-            n = pending.pop()
-            if n in seen or n in initial:
-                continue
-            seen.add(n)
-            _, a, b = recipes[n]
-            pending.append(a)
-            pending.append(b)
-        return seen
-
     def masks(recipes):
         # Integer bitsets make the backward rebuild's marginal-cost estimate
         # cheap; exact union size is recomputed before accepting the move.
@@ -930,8 +1083,9 @@ def anneal_recipes(p, old, deadline, rng):
                 result[n] = result[a] | result[b] | (1 << n)
         return result
 
-    current = list(original)
-    live = selected
+    state = IncrementalClosure(original, roots, initial)
+    current = state.recipes
+    live = state.live
     cost = len(live)
     best_cost = cost
     best_state = list(current)
@@ -940,8 +1094,9 @@ def anneal_recipes(p, old, deadline, rng):
     duration = max(.001, deadline - start)
     while time.monotonic() < deadline:
         trials += 1
-        trial = list(current)
+        undo = []
         if trials % 17 == 0:
+            trial = list(current)
             # Large neighborhood: rebuild backward from all roots. Operands
             # already required by other targets get a direct sharing credit.
             ancestor = masks(current)
@@ -962,19 +1117,24 @@ def anneal_recipes(p, old, deadline, rng):
                 _, a, b = trial[n]
                 required |= (1 << a) | (1 << b)
         else:
+            trial = None
             active = [n for n in mutable if n in live]
             count = 1 if rng.random() < .78 else rng.randint(2, 7)
             for _ in range(count):
                 choices = active if active and rng.random() < .85 else mutable
                 n = rng.choice(choices)
-                trial[n] = rng.choice(pool[n])
-        new_live = closure(trial)
-        new_cost = len(new_live)
+                recipe = rng.choice(pool[n])
+                undo.append((n, state.replace(n, recipe)))
+        if trial is not None:
+            for n, recipe in enumerate(trial):
+                if recipe != current[n]:
+                    undo.append((n, state.replace(n, recipe)))
+        new_cost = len(live)
         delta = new_cost - cost
         phase = ((time.monotonic() - start) / duration * 5) % 1
         temperature = 1.7 * (1 - phase) ** 2 + .06
         if delta <= 0 or rng.random() < math.exp(-delta / temperature):
-            current, live, cost = trial, new_live, new_cost
+            cost = new_cost
             if cost < best_cost:
                 best_cost = cost
                 best_state = list(current)
@@ -985,11 +1145,15 @@ def anneal_recipes(p, old, deadline, rng):
                     best = candidate
                     best_recipes = list(current)
                     hits += 1
+        else:
+            for n, recipe in reversed(undo):
+                state.replace(n, recipe)
         if trials % 211 == 0:
             # Reheat around the shortest closure, allowing neutral recipes to
             # change while keeping the valid output independently protected.
-            current = list(best_state if rng.random() < .8 else best_recipes)
-            live = closure(current)
+            state = IncrementalClosure(
+                best_state if rng.random() < .8 else best_recipes, roots, initial)
+            current, live = state.recipes, state.live
             cost = len(live)
     return best, hits, trials, len(mutable)
 
@@ -1017,6 +1181,7 @@ def annealing_checks():
 def main():
     o = kt.optimization()
     if o['smoke']:
+        incremental_checks()
         annealing_checks()
     if o['smoke']:
         # Exercise shared branches, subtraction, fully occupied registers and
