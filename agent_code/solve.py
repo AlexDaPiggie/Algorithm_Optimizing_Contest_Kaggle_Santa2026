@@ -1,4 +1,4 @@
-"""Incremental reference-count evaluation for annealed arithmetic DAG moves.
+"""Retain deeper E1 x E1 joins as shared, register-allocated DAG nodes.
 
 Build targets around products of cached one-operation dictionary entries,
 then synthesize the signed residual. Preserve every shorter valid incumbent.
@@ -225,24 +225,55 @@ class Frontier:
             return self.e1[t]
         if t in self.memo:
             return self.memo[t]
-        best = None
-        best_cost = 4
+        # A repeated E1 operand costs only two instructions. Test these before
+        # the scan: base operands occur first, so the first remaining hit has
+        # optimal cost (two with a base operand, otherwise three).
+        e1 = self.e1
+        if t % 2 == 0 and t // 2 in e1:
+            e = e1[t // 2]
+            result = ('+', e, e)
+            self.memo[t] = result
+            return result
+        root = math.isqrt(t)
+        if root * root == t and root in e1:
+            e = e1[root]
+            result = ('*', e, e)
+            self.memo[t] = result
+            return result
+        get = e1.get
+        limit = self.limit
         for k, (b, be) in enumerate(self.items):
             if k % 256 == 0 and time.monotonic() >= deadline:
-                return best
-            for a, op, reverse in inverses(t, b, self.limit):
-                ae = self.e1.get(a)
-                if ae is None:
-                    continue
-                expr = combine(op, ae, be, reverse)
-                cost = expression_cost(expr)
-                if cost < best_cost:
-                    best, best_cost = expr, cost
-                    if cost <= 2:
-                        self.memo[t] = best
-                        return best
-        self.memo[t] = best
-        return best
+                # A partial negative lookup must never enter the E2 memo.
+                return None
+            ae = get(t - b) if t > b else None
+            if ae is not None:
+                result = ('+', ae, be)
+            else:
+                ae = get(t + b) if t + b <= limit else None
+                if ae is not None:
+                    result = ('-', ae, be)
+                else:
+                    ae = get(b - t) if b > t else None
+                    if ae is not None:
+                        result = ('-', be, ae)
+                    else:
+                        ae = get(t // b) if t % b == 0 else None
+                        if ae is not None:
+                            result = ('*', ae, be)
+                        else:
+                            ae = get(t * b) if b <= limit // t else None
+                            if ae is not None:
+                                result = ('/', ae, be)
+                            else:
+                                ae = get(b // t) if b % t == 0 else None
+                                if ae is None:
+                                    continue
+                                result = ('/', be, ae)
+            self.memo[t] = result
+            return result
+        self.memo[t] = None
+        return None
 
     def find(self, t, max_cost, deadline):
         best = self.join(t, deadline)
@@ -273,7 +304,7 @@ class Frontier:
                 n = expression_cost(expr)
                 if n < cost and n <= max_cost:
                     best, cost = expr, n
-            if cost <= 3:
+            if cost <= 4:
                 break
         return best if cost <= max_cost else None
 
@@ -440,11 +471,12 @@ def optimize(p, old, deadline):
                 candidates.append((len(cone), root, cone))
         if not candidates:
             break
-        # Small internal cones often expose cheap arithmetic that target-only
-        # search misses. Mix them with large target cones rather than spending
-        # the entire budget on the largest, most difficult target values.
+        # Later targets have the richest bank of retained operands. Try their
+        # expensive cones first, then use any remaining time on internal cones.
+        target_roots = set(dag.roots)
         candidates.sort(key=lambda item: (
-            -min(item[0], 10), dag.values[item[1]].bit_length(), item[1]))
+            item[1] not in target_roots,
+            -min(item[0], 10), -dag.rank[item[1]], item[1]))
         size, root, cone = candidates[0]
         attempted.add(root)
         # All bases are already required outside the removed cone. Their cost
@@ -558,6 +590,18 @@ class RemainderPlanner:
         if direct is not None and expression_cost(direct) < cost:
             best, cost = direct, expression_cost(direct)
         if cost <= 3 or time.monotonic() >= self.deadline:
+            return best
+
+        # Spend a bounded part of this target's allowance on exact depth 4/5
+        # before resorting to an approximate product and residual. Emission
+        # retains both E1 branches, so later targets can reuse their values.
+        deep_end = time.monotonic() + max(0, self.deadline - time.monotonic()) * .3
+        deep = self.frontier.find(target, min(5, cost - 1), deep_end)
+        if deep is not None:
+            n = expression_cost(deep)
+            if n < cost:
+                best, cost = deep, n
+        if cost <= 4 or time.monotonic() >= self.deadline:
             return best
 
         # Nearest neighbours of target/a are the most promising E1 partners.
@@ -1181,6 +1225,7 @@ def annealing_checks():
 def main():
     o = kt.optimization()
     if o['smoke']:
+        smoke_checks()
         incremental_checks()
         annealing_checks()
     if o['smoke']:
@@ -1236,13 +1281,22 @@ def main():
         if trial is not None and len(trial) < len(current[pid]) and replay(p, trial):
             current[pid] = trial
         construction_length = len(trial) if trial is not None else None
+        # The incumbent provides cheap retained operands. Lift an exact E1 x
+        # E1 join by another base/E1 operation and replace only an exclusive
+        # cone. The allocator keeps shared intermediates in real registers;
+        # a lower closure size alone is never sufficient for acceptance.
+        deep_end = time.monotonic() + max(0, end - time.monotonic()) * .65
+        new, deep_hits = optimize(p, current[pid], deep_end)
+        if len(new) < len(current[pid]) and replay(p, new):
+            current[pid] = new
         new, hits, trials, alternatives = anneal_recipes(
             p, current[pid], end, random.Random(o['seed'] + k))
         if len(new) < len(current[pid]) and replay(p, new):
             current[pid] = new
         print(pid, len(old), '->', len(current[pid]),
               'adaptive construction', construction_length, 'annealing hits', hits,
-              'trials', trials, 'mutable nodes', alternatives, flush=True)
+              'deep joins', deep_hits, 'trials', trials,
+              'mutable nodes', alternatives, flush=True)
 
     out = Path(o['solution'])
     out.parent.mkdir(parents=True, exist_ok=True)
