@@ -1,4 +1,4 @@
-"""Retain deeper E1 x E1 joins as shared, register-allocated DAG nodes.
+"""Close residual-planner gaps with binary Horner construction from 1.
 
 Build targets around products of cached one-operation dictionary entries,
 then synthesize the signed residual. Preserve every shorter valid incumbent.
@@ -161,6 +161,49 @@ def fallback_checks(puzzles):
                 raise ValueError('Horner fallback regression: radix ' + str(radix))
             count += 1
     print('Validated', count, 'Horner fallback regressions including absent anchors', flush=True)
+    # Bypass bootstrap to reproduce the missing-stepping-stone failure.
+    # An expired search deadline must still yield a legal construction.
+    planner_cases = [
+        dict(start=[97], targets=[1, 2, 3, 6, 15, 17, 127, 255, 256, 999], limit=999),
+        dict(start=[1], targets=[1, 3, 15, 17, 257, 65537], limit=65537),
+        dict(start=[10**18], targets=[1, 2**59, 10**18 - 1], limit=10**18),
+        dict(start=[3], targets=[1, 2, 5, 8], limit=9),
+    ]
+    if 'scored_0006' in puzzles:
+        planner_cases.append(puzzles['scored_0006'])
+    rng = random.Random(6006)
+    for _ in range(12):
+        limit = rng.randrange(1000, 10**18)
+        planner_cases.append(dict(start=[rng.randrange(2, limit + 1)],
+                                  targets=sorted({rng.randrange(1, limit + 1) for _ in range(4)}),
+                                  limit=limit))
+    checks = 0
+    for p in planner_cases:
+        for target in p['targets']:
+            if target in p['start']:
+                continue
+            cache = ConstructCache(p)
+            planner = RemainderPlanner(cache.regs, p['limit'], time.monotonic() - 1)
+            expr = planner.find(target)
+            if expr is None:
+                raise ValueError('Horner planner returned no expression')
+            cache.emit(expr)
+            single = dict(p, targets=[target])
+            if not replay(single, cache.program):
+                raise ValueError('invalid Horner planner fallback')
+            if planner.horner(target) != expr:
+                raise ValueError('unstable Horner memo')
+            checks += 1
+    # Saturated registers exercise destruction of unprotected seeds while
+    # the sole expression leaf and the shared unit remain live.
+    p = dict(start=list(range(101, 149)), targets=[10**18 - 1], limit=10**18)
+    cache = ConstructCache(p)
+    cache.protected = {101}
+    planner = RemainderPlanner(cache.regs, p['limit'], time.monotonic() - 1)
+    cache.emit(planner.find(p['targets'][0]))
+    if not replay(p, cache.program):
+        raise ValueError('invalid full-register Horner fallback')
+    print('Validated', checks + 1, 'sparse planner fallbacks including expired deadlines', flush=True)
 
 
 def inverses(t, b, limit):
@@ -556,6 +599,8 @@ class RemainderPlanner:
         return None
 
     def horner(self, t):
+        if not 0 < t <= self.limit:
+            return None
         if t in self.horner_memo:
             return self.horner_memo[t]
         result = self.two(t)
@@ -577,7 +622,29 @@ class RemainderPlanner:
             n = expression_cost(expr)
             if n < cost:
                 best, cost = expr, n
-        # Constants 1..8 and 16 supply every radix-16 digit in at most one op.
+        if best is None and 0 < t <= self.limit:
+            # A sparse dictionary need not contain a radix or a stepping
+            # stone. Self-division always supplies 1; binary Horner then
+            # visits positive prefixes <= t, even with an expired deadline.
+            # Immutable tuples retain the shared 1 and any cached prefixes.
+            one = self.e1.get(1)
+            if one is not None:
+                two = self.e1.get(2)
+                if two is None:
+                    two = ('+', one, one)
+                best = one
+                prefix = 1
+                for bit in bin(t)[3:]:
+                    prefix = prefix * 2 + (bit == '1')
+                    cached = self.e1.get(prefix)
+                    if cached is not None:
+                        best = cached
+                        continue
+                    # Multiplication by the shared 2 keeps expression tuples
+                    # linear in size (nested repeated additions do not).
+                    best = ('*', best, two)
+                    if bit == '1':
+                        best = ('+', best, one)
         self.horner_memo[t] = best
         return best
 
@@ -1262,6 +1329,9 @@ def main():
     for pid, p in puzzles.items():
         if not replay(p, current[pid]):
             raise ValueError('invalid baseline: ' + pid)
+
+    if o['smoke']:
+        fallback_checks(puzzles)
 
     ids = sorted(puzzles)[:6] if o['smoke'] else sorted(puzzles)
     before = sum(len(current[pid]) for pid in ids)
