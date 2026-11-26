@@ -1,5 +1,7 @@
 # Code only: data, predictions and supervisor state stay out of git
 data/
+CLAUDE.md
+AGENTS.md
 .kaggle-agent/
 *.zip
 *.parquet
