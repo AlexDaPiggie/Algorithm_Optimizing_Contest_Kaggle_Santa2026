@@ -1,8 +1,9 @@
-"""Construct with a bounded beam of cached signed quotient reductions.
+"""Reuse unchanged register-pair arithmetic between target searches.
 
-Use t = q*b +/- r with zero/one-operation cached recipes for b and r,
-then search the smaller quotient. Retain complete Horner plans at every
-cutoff, count shared expression nodes exactly, and preserve valid incumbents.
+The dictionary retains the exact insertion order and physical-register
+recipes of a fresh Frontier, but recomputes only changed operand pairs.
+Search, exact expression costs, allocation and incumbent validation remain
+the same as the signed quotient beam solver.
 """
 import csv
 import bisect
@@ -234,13 +235,58 @@ def expression_cost(expr):
     return len(seen)
 
 
+class PairFrontierCache:
+    """Bounded per-puzzle cache of arithmetic for physical register pairs.
+
+    Entries contain the operand values as well as their physical indices.
+    Thus overwrites, duplicated values and changing canonical registers all
+    invalidate the affected pairs. Query memos are never retained, because
+    their expressions depend on the complete register snapshot.
+    """
+    def __init__(self, limit):
+        self.limit = limit
+        self.pairs = [None] * (48 * 48)
+
+    def expand(self, base):
+        e1 = base.copy()
+        put = e1.setdefault
+        pairs, limit = self.pairs, self.limit
+        vals = list(base.items())
+        for i, (a, ar) in enumerate(vals):
+            row = ar * 48
+            for b, br in vals[i:]:
+                key = row + br
+                entry = pairs[key]
+                if entry is None or entry[0] != a or entry[1] != b:
+                    results = []
+                    for op, x, y, xr, yr in (
+                        ('+', a, b, ar, br), ('*', a, b, ar, br),
+                        ('-', a, b, ar, br), ('-', b, a, br, ar),
+                        ('/', a, b, ar, br), ('/', b, a, br, ar)):
+                        value = calc(op, x, y, limit)
+                        if value is not None:
+                            results.append((value, (op, xr, yr)))
+                    entry = (a, b, results)
+                    pairs[key] = entry
+                for value, expr in entry[2]:
+                    put(value, expr)
+        return e1
+
+
 class Frontier:
-    def __init__(self, regs, limit):
+    def __init__(self, regs, limit, pair_cache=None):
         self.limit = limit
         self.base = {}
         for r, v in enumerate(regs):
             if v is not None:
                 self.base.setdefault(v, r)
+        if pair_cache is not None:
+            if pair_cache.limit != limit:
+                raise ValueError('frontier cache used with a different value limit')
+            self.e1 = pair_cache.expand(self.base)
+            self.items = list(self.e1.items())
+            self.memo = {}
+            return
         self.e1 = self.base.copy()
         vals = list(self.base.items())
         # Immutable expression tuples permit exact shared-intermediate reuse.
@@ -566,8 +612,8 @@ class RemainderPlanner:
     one-step dictionary values. An exact, inexpensive residual completes it.
     All expressions refer to the current physical register snapshot.
     """
-    def __init__(self, regs, limit, deadline):
-        self.frontier = Frontier(regs, limit)
+    def __init__(self, regs, limit, deadline, pair_cache=None):
+        self.frontier = Frontier(regs, limit, pair_cache)
         self.e1 = self.frontier.e1
         self.base = self.frontier.base
         self.limit = limit
@@ -852,6 +898,7 @@ class ConstructCache:
         self.protected = set(p['start'])
         self.age = [0] * 48
         self.clock = 0
+        self.frontier_cache = PairFrontierCache(p['limit'])
 
     def emit(self, expr):
         nodes = []
@@ -918,7 +965,7 @@ class ConstructCache:
             return False
         for target in range(1, min(8, self.p['limit']) + 1):
             if target not in self.regs:
-                f = Frontier(self.regs, self.p['limit'])
+                f = Frontier(self.regs, self.p['limit'], self.frontier_cache)
                 expr = f.e1.get(target)
                 if expr is None:
                     return False
@@ -959,7 +1006,8 @@ def construct_remainders(p, deadline, reverse=False):
         # Preserve work when search time expires: find() retains a complete
         # Horner expression and skips all optional searches after its deadline.
         share = max(0, deadline - time.monotonic()) / max(1, len(targets) - k)
-        planner = RemainderPlanner(cache.regs, p['limit'], time.monotonic() + share)
+        planner = RemainderPlanner(cache.regs, p['limit'], time.monotonic() + share,
+                                   cache.frontier_cache)
         expr = planner.find(target)
         if expr is None:
             return None
@@ -1402,6 +1450,77 @@ def signed_radix_checks():
     print('Signed quotient beam: both signs, shared nodes, tight limits, full registers and cutoffs passed', flush=True)
 
 
+def frontier_cache_checks(puzzles, current):
+    """Compare exact recipes/order after legal writes and destructive aliases."""
+    rng = random.Random(194502)
+    segments = []
+    for limit in (9, 10000, 10**18):
+        regs = [rng.randrange(1, min(limit, 1000) + 1) for _ in range(48)]
+        snapshots = [regs[:]]
+        for step in range(23):
+            for _ in range(4):
+                defined = [r for r, v in enumerate(regs) if v is not None]
+                i, j = rng.choice(defined), rng.choice(defined)
+                op = rng.choice(('+', '-', '*', '/'))
+                value = calc(op, regs[i], regs[j], limit)
+                if value is not None:
+                    regs[rng.randrange(48)] = value
+            # Force duplicated/canonical leaves, undefined slots and returns
+            # to an earlier value independently of random arithmetic.
+            if step % 5 == 0:
+                regs[0] = 1
+                regs[1] = 1 if step % 10 else None
+            snapshots.append(regs[:])
+        segments.append((limit, snapshots))
+
+    # Capture actual incumbent register states at successive target hits.
+    for pid in sorted(puzzles)[:3]:
+        p = puzzles[pid]
+        regs = p['start'][:] + [None] * (48 - len(p['start']))
+        remaining = set(p['targets']) - set(p['start'])
+        snapshots = [regs[:]]
+        for op, i, j, d in current[pid]:
+            value = calc(op, regs[i], regs[j], p['limit'])
+            regs[d] = value
+            if value in remaining:
+                remaining.remove(value)
+                snapshots.append(regs[:])
+                if len(snapshots) >= 24:
+                    break
+        segments.append((p['limit'], snapshots))
+
+    full_time = cached_time = 0.0
+    cases = 0
+    for limit, snapshots in segments:
+        start = time.perf_counter()
+        references = [Frontier(regs, limit) for regs in snapshots]
+        full_time += time.perf_counter() - start
+        cache = PairFrontierCache(limit)
+        start = time.perf_counter()
+        actual = [Frontier(regs, limit, cache) for regs in snapshots]
+        cached_time += time.perf_counter() - start
+        for n, (reference, candidate) in enumerate(zip(references, actual)):
+            assert reference.base == candidate.base
+            assert reference.items == candidate.items, 'cached E1 recipes/order differ'
+            assert candidate.memo == {}, 'query memo leaked across snapshots'
+            if n % 8 == 0:
+                for target in (1, min(limit, 17), limit):
+                    expected = reference.join(target, float('inf'))
+                    found = candidate.join(target, float('inf'))
+                    assert expected == found, 'cached join differs'
+            cases += 1
+    # Expired searches remove timing variation and exercise exact construction
+    # and physical allocation with the retained pair cache end to end.
+    for pid in sorted(puzzles)[:2]:
+        p = puzzles[pid]
+        result = construct_remainders(p, time.monotonic() - 1)
+        assert result is None or replay(p, result)
+    print('Pair dictionary:', cases, 'snapshots exactly matched fresh rebuilds;',
+          'build speedup', round(full_time / max(cached_time, 1e-9), 2), 'x',
+          'fresh seconds', round(full_time, 4), 'cached seconds', round(cached_time, 4),
+          flush=True)
+
+
 def main():
     o = kt.optimization()
     if o['smoke']:
@@ -1445,6 +1564,7 @@ def main():
             raise ValueError('invalid baseline: ' + pid)
 
     if o['smoke']:
+        frontier_cache_checks(puzzles, current)
         fallback_checks(puzzles)
 
     ids = sorted(puzzles)[:6] if o['smoke'] else sorted(puzzles)
