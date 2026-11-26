@@ -1,13 +1,8 @@
-"""Close residual-planner gaps with binary Horner construction from 1.
+"""Construct with a bounded beam of cached signed quotient reductions.
 
-Build targets around products of cached one-operation dictionary entries,
-then synthesize the signed residual. Preserve every shorter valid incumbent.
-
-An incumbent remains the fallback. Replace an exclusive dependency cone only
-when its exact union of required instructions becomes smaller.
-E1 contains every legal one-operation value over the current physical cache.
-Inverse arithmetic joins two E1 entries, optionally under one more E1 operation,
-finding expressions of up to five operations without a quadratic E1 product.
+Use t = q*b +/- r with zero/one-operation cached recipes for b and r,
+then search the smaller quotient. Retain complete Horner plans at every
+cutoff, count shared expression nodes exactly, and preserve valid incumbents.
 """
 import csv
 import bisect
@@ -581,6 +576,84 @@ class RemainderPlanner:
         self.two_memo = {}
         self.horner_memo = {}
 
+    def signed_radix(self, target, incumbent, deadline):
+        """Beam search over signed quotient reductions with cached E1 digits.
+
+        Each edge represents t = q*b +/- r. Both b and r must already
+        have zero/one-operation recipes in the current cache; only q is
+        searched recursively. A complete legal Horner plan is always kept.
+        """
+        if time.monotonic() >= deadline:
+            return incumbent
+        best, best_cost = incumbent, expression_cost(incumbent)
+        items = [(v, e, int(not isinstance(e, int)))
+                 for v, e in self.e1.items() if v > 1]
+        serial = 0
+        queue = [(0.0, serial, target, 0, ())]
+        visited = {target: 0}
+
+        def complete(leaf, path):
+            result = leaf
+            for be, re, op in reversed(path):
+                product = ('*', result, be)
+                result = (op, product, re) if re is not None else product
+            return result
+
+        expansions = 0
+        while queue and expansions < 32 and time.monotonic() < deadline:
+            _, _, t, paid, path = heapq.heappop(queue)
+            if visited.get(t) != paid:
+                continue
+            leaf = self.horner(t)
+            if leaf is not None:
+                expr = complete(leaf, path)
+                n = expression_cost(expr)
+                if n < best_cost:
+                    best, best_cost = expr, n
+            if t in self.e1 or len(path) >= 8:
+                continue
+            expansions += 1
+            proposals = []
+            for k, (b, be, bc) in enumerate(items):
+                if k % 64 == 0 and time.monotonic() >= deadline:
+                    break
+                if b >= t:
+                    continue
+                q, r = divmod(t, b)
+                variants = [(q, r, '+')]
+                if r and (q + 1) * b <= self.limit:
+                    variants.append((q + 1, b - r, '-'))
+                for q, r, op in variants:
+                    if q >= t:
+                        continue
+                    re = self.e1.get(r) if r else None
+                    if r and re is None:
+                        continue
+                    edge = 1 + bc + (1 + int(not isinstance(re, int)) if r else 0)
+                    new_paid = paid + edge
+                    if new_paid >= visited.get(q, 10**9):
+                        continue
+                    new_path = path + ((be, re, op),)
+                    qe = self.e1.get(q)
+                    if qe is not None:
+                        expr = complete(qe, new_path)
+                        n = expression_cost(expr)
+                        if n < best_cost:
+                            best, best_cost = expr, n
+                    else:
+                        # Heuristic only orders the beam; it never approves
+                        # an expression or substitutes for exact DAG cost.
+                        estimate = new_paid + 2 + max(0, q.bit_length() - 16) * .20
+                        proposals.append((estimate, q, new_paid, new_path))
+            proposals.sort(key=lambda row: (row[0], row[1]))
+            for estimate, q, new_paid, new_path in proposals[:16]:
+                if new_paid >= visited.get(q, 10**9):
+                    continue
+                visited[q] = new_paid
+                serial += 1
+                heapq.heappush(queue, (estimate, serial, q, new_paid, new_path))
+        return best
+
     def two(self, t):
         if t in self.e1:
             return self.e1[t]
@@ -656,6 +729,14 @@ class RemainderPlanner:
         direct = self.frontier.join(target, self.deadline)
         if direct is not None and expression_cost(direct) < cost:
             best, cost = direct, expression_cost(direct)
+        if cost <= 3 or time.monotonic() >= self.deadline:
+            return best
+
+        radix_end = time.monotonic() + max(0, self.deadline - time.monotonic()) * .35
+        adaptive = self.signed_radix(target, best, radix_end)
+        n = expression_cost(adaptive)
+        if n < cost:
+            best, cost = adaptive, n
         if cost <= 3 or time.monotonic() >= self.deadline:
             return best
 
@@ -875,9 +956,9 @@ def construct_remainders(p, deadline, reverse=False):
     for k, target in enumerate(targets):
         if target in cache.covered:
             continue
-        if time.monotonic() >= deadline:
-            return None
-        share = (deadline - time.monotonic()) / max(1, len(targets) - k)
+        # Preserve work when search time expires: find() retains a complete
+        # Horner expression and skips all optional searches after its deadline.
+        share = max(0, deadline - time.monotonic()) / max(1, len(targets) - k)
         planner = RemainderPlanner(cache.regs, p['limit'], time.monotonic() + share)
         expr = planner.find(target)
         if expr is None:
@@ -1289,12 +1370,45 @@ def annealing_checks():
     print('Recipe annealing: shared closures, exact division and aliases passed', flush=True)
 
 
+def signed_radix_checks():
+    """Check both signs, common subexpressions, limits and physical aliases."""
+    a, b, c, d = 101, 109, 127, 137
+    x, y, residue = a * b, c * d, a + b
+    for sign in (1, -1):
+        for shared in (False, True):
+            target = x * (x if shared else y) + sign * residue
+            p = dict(start=[a, b, c, d], targets=[target],
+                     limit=max(target, x * (x if shared else y)))
+            cache = ConstructCache(p)
+            planner = RemainderPlanner(cache.regs, p['limit'], time.monotonic() + .1)
+            seed = planner.horner(target)
+            expr = planner.signed_radix(target, seed, time.monotonic() + .05)
+            assert expression_cost(expr) <= (4 if shared else 5)
+            cache.emit(expr)
+            assert replay(p, cache.program)
+            assert planner.signed_radix(target, seed, time.monotonic() - 1) == seed
+    p = dict(start=list(range(101, 149)), targets=[x * y - residue], limit=x * y)
+    cache = ConstructCache(p)
+    cache.protected = set()
+    planner = RemainderPlanner(cache.regs, p['limit'], time.monotonic() + .1)
+    seed = planner.horner(p['targets'][0])
+    expr = planner.signed_radix(p['targets'][0], seed, time.monotonic() + .05)
+    cache.emit(expr)
+    assert replay(p, cache.program)
+    # Completion after a search cutoff must still cover every target.
+    p = dict(start=[97], targets=[1, 2, 3, 17, 257, 65537], limit=65537)
+    program = construct_remainders(p, time.monotonic() - 1)
+    assert program is not None and replay(p, program)
+    print('Signed quotient beam: both signs, shared nodes, tight limits, full registers and cutoffs passed', flush=True)
+
+
 def main():
     o = kt.optimization()
     if o['smoke']:
         smoke_checks()
         incremental_checks()
         annealing_checks()
+        signed_radix_checks()
     if o['smoke']:
         # Exercise shared branches, subtraction, fully occupied registers and
         # destination/source aliasing independently of the supplied baseline.
@@ -1344,7 +1458,7 @@ def main():
             if len(fallback) < len(current[pid]) and replay(p, fallback):
                 current[pid] = fallback
         try:
-            trial = construct_remainders(p, time.monotonic() + max(0, end - time.monotonic()) * .22)
+            trial = construct_remainders(p, time.monotonic() + max(0, end - time.monotonic()) * .80)
         except (ValueError, KeyError, RecursionError) as exc:
             print(pid, 'construction discarded:', str(exc), flush=True)
             trial = None
