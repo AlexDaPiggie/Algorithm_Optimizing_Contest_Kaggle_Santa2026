@@ -1,9 +1,8 @@
-"""Reuse unchanged register-pair arithmetic between target searches.
+"""Local search with newly synthesized, shared one-operation bridge donors.
 
-The dictionary retains the exact insertion order and physical-register
-recipes of a fresh Frontier, but recomputes only changed operand pairs.
-Search, exact expression costs, allocation and incumbent validation remain
-the same as the signed quotient beam solver.
+Retain the incumbent construction and arithmetic searches, then enrich its
+annealing DAG with bounded bridge values used by multiple target recipes.
+Joint bridge moves expose sharing that single-target rewrites cannot find.
 """
 import csv
 import bisect
@@ -1245,6 +1244,131 @@ def incremental_checks():
           round(full_time / max(fast_time, 1e-9), 2), 'x', flush=True)
 
 
+def shared_bridge_donors(dag, limit, deadline):
+    """Add absent one-op values only when two target roots can reuse them.
+
+    Inverse target probes specify the useful values; bounded donor pairs
+    supply their recipes. Every bridge is inserted immediately after its
+    latest operand, and every consumer must occur later, preserving the
+    original acyclic donor ordering and incremental closure invariants.
+    """
+    selected = dag.closure()
+    initial = set(dag.initial)
+    present = set(dag.values)
+    uses = [0] * len(dag.values)
+    cones = [0] * len(dag.values)
+    for n, recipe in enumerate(dag.recipes):
+        if recipe is not None:
+            _, a, b = recipe
+            cones[n] = cones[a] | cones[b] | (1 << n)
+    for n in selected:
+        for a in set(dag.recipes[n][1:]):
+            uses[a] += 1
+    sources = sorted(selected | initial,
+                     key=lambda n: (n not in initial, -uses[n], n))
+    builders = sorted(sources[:96])
+    carriers = sources[:192]
+    needed = {}
+    for n in dag.roots:
+        if n in initial:
+            continue
+        if time.monotonic() >= deadline:
+            return {}, []
+        target = dag.values[n]
+        for c in carriers:
+            if c >= n:
+                continue
+            for value, op, reverse in inverses(target, dag.values[c], limit):
+                if value not in present:
+                    needed.setdefault(value, []).append((n, op, c, reverse))
+
+    # One bridge must have at least two distinct target consumers. The same
+    # target may have several inverse recipes, but that is not sharing.
+    needed = {v: offers for v, offers in needed.items()
+              if len({x[0] for x in offers}) >= 2}
+    found = {}
+
+    def probe(v, recipe):
+        offers = needed.get(v)
+        if not offers:
+            return
+        _, a, b = recipe
+        latest = max(a, b)
+        eligible = {}
+        for n, op, c, reverse in offers:
+            if latest >= n:
+                continue
+            # An operand occurring in several target alternatives is selected
+            # by its actual original dependency union, not integer magnitude.
+            cost = (cones[a] | cones[b] | cones[c]).bit_count()
+            if n not in eligible or cost < eligible[n][0]:
+                eligible[n] = (cost, op, c, reverse)
+        if len(eligible) < 2:
+            return
+        score = (-len(eligible), sum(x[0] for x in eligible.values()), latest)
+        if v not in found or score < found[v][0]:
+            found[v] = (score, recipe, eligible)
+
+    for k, a in enumerate(builders):
+        if time.monotonic() >= deadline:
+            break
+        av = dag.values[a]
+        for b in builders[k:]:
+            bv = dag.values[b]
+            if av + bv <= limit:
+                probe(av + bv, ('+', a, b))
+            if av > bv:
+                probe(av - bv, ('-', a, b))
+            elif bv > av:
+                probe(bv - av, ('-', b, a))
+            if av <= limit // bv:
+                probe(av * bv, ('*', a, b))
+            if av % bv == 0:
+                probe(av // bv, ('/', a, b))
+            if bv % av == 0:
+                probe(bv // av, ('/', b, a))
+    if not found:
+        return {}, []
+
+    chosen = sorted(found, key=lambda v: (found[v][0], v))[:32]
+    old_size = len(dag.values)
+    values = list(dag.values)
+    recipes = list(dag.recipes)
+    positions = list(range(old_size))
+    for v in chosen:
+        recipe = found[v][1]
+        values.append(v)
+        recipes.append(recipe)
+        positions.append(max(recipe[1:]) + .5)
+    order = sorted(range(len(values)), key=lambda n: (positions[n], n))
+    remap = {n: k for k, n in enumerate(order)}
+
+    def mapped(recipe):
+        if recipe is None:
+            return None
+        op, a, b = recipe
+        return (op, remap[a], remap[b])
+
+    dag.values = [values[n] for n in order]
+    dag.recipes = [mapped(recipes[n]) for n in order]
+    dag.rank = list(map(float, range(len(order))))
+    dag.initial = {remap[n]: r for n, r in dag.initial.items()}
+    dag.roots = sorted(remap[n] for n in dag.roots)
+    extra = {}
+    moves = []
+    for k, v in enumerate(chosen):
+        bridge = remap[old_size + k]
+        edits = []
+        for n, (_, op, c, reverse) in found[v][2].items():
+            recipe = (op, remap[c], bridge) if reverse else (op, bridge, remap[c])
+            dest = remap[n]
+            assert max(recipe[1:]) < dest
+            extra.setdefault(dest, []).append(recipe)
+            edits.append((dest, recipe))
+        moves.append(edits)
+    return extra, moves
+
+
 def anneal_recipes(p, old, deadline, rng):
     """Search whole dependency closures, including neutral and uphill moves.
 
@@ -1253,9 +1377,15 @@ def anneal_recipes(p, old, deadline, rng):
     rewards sharing rather than the isolated length of a target expression.
     """
     dag = ArithmeticDAG(p, old)
+    bridge_end = time.monotonic() + max(0, deadline - time.monotonic()) * .28
+    extra, bridge_moves = shared_bridge_donors(dag, p['limit'], bridge_end)
     initial = set(dag.initial)
     original = list(dag.recipes)
     pool = [[recipe] if recipe is not None else [] for recipe in original]
+    for n, recipes in extra.items():
+        for recipe in recipes:
+            if recipe not in pool[n]:
+                pool[n].append(recipe)
     index = {v: n for n, v in enumerate(dag.values)}
     selected = dag.closure()
     compact = dag.allocate(selected)
@@ -1335,7 +1465,13 @@ def anneal_recipes(p, old, deadline, rng):
     while time.monotonic() < deadline:
         trials += 1
         undo = []
-        if trials % 17 == 0:
+        if bridge_moves and trials % 11 == 0:
+            # Large neighborhood: switch all consumers of a new shared donor
+            # together so its one-time construction cost is paid only once.
+            trial = None
+            for n, recipe in rng.choice(bridge_moves):
+                undo.append((n, state.replace(n, recipe)))
+        elif trials % 17 == 0:
             trial = list(current)
             # Large neighborhood: rebuild backward from all roots. Operands
             # already required by other targets get a direct sharing credit.
@@ -1416,6 +1552,50 @@ def annealing_checks():
     new, _, _, _ = anneal_recipes(p, old, time.monotonic() + .03, random.Random(28))
     assert replay(p, new) and len(new) <= len(old)
     print('Recipe annealing: shared closures, exact division and aliases passed', flush=True)
+
+
+def bridge_checks():
+    # The donor 5 is absent from the incumbent. Old-only recipe mutation
+    # cannot use it; the new joint move shares 6-1 between 30 and 35.
+    p = dict(start=[1, 6, 7, 10], targets=[30, 35], limit=100)
+    old = [['+', 3, 3, 4], ['+', 4, 3, 5],
+           ['*', 2, 2, 6], ['+', 2, 2, 7], ['-', 6, 7, 8]]
+    assert replay(p, old)
+    dag = ArithmeticDAG(p, old)
+    assert 5 not in dag.values
+    extra, moves = shared_bridge_donors(dag, p['limit'], time.monotonic() + .1)
+    assert 5 in dag.values and extra and moves
+    assert all(recipe is None or max(recipe[1:]) < n
+               for n, recipe in enumerate(dag.recipes))
+    assert replay(p, dag.allocate(dag.closure()))
+    for n, recipes in extra.items():
+        for op, a, b in recipes:
+            assert max(a, b) < n
+            assert calc(op, dag.values[a], dag.values[b], p['limit']) == dag.values[n]
+    new, hits, trials, _ = anneal_recipes(
+        p, old, time.monotonic() + .14, random.Random(751))
+    assert replay(p, new) and len(new) == 3 and hits, (len(new), trials)
+
+    # Check incremental joint edits and reverse-order rollback against a full
+    # dependency traversal on the enriched graph, including inactive donors.
+    state = IncrementalClosure(dag.recipes, dag.roots, dag.initial)
+    original = list(state.recipes)
+    for edits in moves:
+        undo = [(n, state.replace(n, recipe)) for n, recipe in edits]
+        dag.recipes = state.recipes
+        assert state.live == dag.closure()
+        program = dag.allocate(state.live)
+        assert program is None or replay(p, program)
+        for n, recipe in reversed(undo):
+            state.replace(n, recipe)
+        assert state.recipes == original and state.live == dag.closure()
+    # With no missing targets there must be no invented bridge instructions.
+    p = dict(start=[1, 2, 3], targets=[1, 2], limit=3)
+    dag = ArithmeticDAG(p, [])
+    assert shared_bridge_donors(dag, 3, time.monotonic() + .01) == ({}, [])
+    assert replay(p, dag.allocate(dag.closure()))
+    print('Absent shared bridge: 5 -> 3 instructions; ordering, joint edits and rollback passed',
+          flush=True)
 
 
 def signed_radix_checks():
@@ -1527,6 +1707,7 @@ def main():
         smoke_checks()
         incremental_checks()
         annealing_checks()
+        bridge_checks()
         signed_radix_checks()
     if o['smoke']:
         # Exercise shared branches, subtraction, fully occupied registers and
